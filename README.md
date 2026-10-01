@@ -48,11 +48,23 @@ a different convention:
 python -m app dataset path/to/data.csv --date-order mdy
 ```
 
+Dates such as `03/04/2026` are quarantined by default because both DMY and MDY
+interpretations are valid. If a source profile confirms its convention, opt in
+to resolving those values:
+
+```bash
+python -m app dataset path/to/data.csv --date-order dmy --trust-date-order
+```
+
 Each successful run produces:
 
 - `cleaned.parquet` — whitespace/missing values normalized and safe types cast
 - `dataset_report.json` — schema, missing counts, unique counts, and duplicates
 - `csv_inspection.json` — encoding, delimiter, headers, and row-width checks
+- `repaired.csv` — all `VALID` and deterministically `REPAIRED` rows
+- `quarantine.csv` — `AMBIGUOUS` rows with reasons and original source text
+- `repair_log.json` — repair counts, inferred schema, and changed-row details
+- `row_status.csv` — one `VALID`, `REPAIRED`, or `AMBIGUOUS` result per source row
 - `job.json` — job lifecycle and artifact metadata
 
 Dates are stored as real Parquet date values. UK `DD/MM/YYYY` display formatting
@@ -60,9 +72,13 @@ will be applied when XLSX output is introduced; display formatting is not stored
 inside Parquet. Exact duplicate rows are reported but retained because repeated
 observations can be legitimate data.
 
-Step 4 deliberately does not repair rows with too many or too few fields. Such
-files fail safely and retain `csv_inspection.json` for the deterministic repair
-work in Step 5. Step 4 currently accepts UTF-8 input and requires a header row.
+Step 5 evaluates malformed rows against a schema inferred from the conforming
+majority. It applies a repair only when exactly one candidate satisfies that
+schema. Missing source values, duplicate keys, exact duplicates, invalid types,
+outliers, and multiple valid alignments are quarantined instead of guessed.
+
+The MVP repair reader accepts UTF-8 input with a header and assumes one source
+record per physical line. Valid multiline quoted fields are a later extension.
 
 ## Checks
 

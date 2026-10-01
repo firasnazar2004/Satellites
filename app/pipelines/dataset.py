@@ -13,6 +13,7 @@ from app.models.dataset import (
     DateOrder,
     MalformedRow,
 )
+from app.pipelines.csv_repair import repair_csv_file
 
 
 INSPECTION_FILE_NAME = "csv_inspection.json"
@@ -89,21 +90,28 @@ def process_dataset_file(
     output_dir: Path,
     *,
     date_order: DateOrder = "dmy",
+    trust_date_order: bool = False,
 ) -> list[Path]:
-    """Validate and clean a well-formed CSV into typed Parquet plus reports."""
+    """Repair, validate, and clean CSV data into typed Parquet plus reports."""
 
-    inspection = inspect_csv(input_path)
+    repair_result = repair_csv_file(
+        input_path,
+        output_dir,
+        date_order=date_order,
+        trust_date_order=trust_date_order,
+    )
+    inspection = inspect_csv(repair_result.repaired_path)
     inspection_path = output_dir / INSPECTION_FILE_NAME
     inspection_path.write_text(inspection.model_dump_json(indent=2), encoding="utf-8")
 
     if inspection.malformed_row_count:
         raise MalformedCsvError(
             f"Found {inspection.malformed_row_count} row(s) with the wrong number "
-            f"of columns. See {inspection_path}. Automated repair belongs to MVP Step 5."
+            f"of columns after repair. See {inspection_path}."
         )
 
     frame = pl.read_csv(
-        input_path,
+        repair_result.repaired_path,
         separator=inspection.delimiter,
         encoding="utf8",
         has_header=True,
@@ -140,8 +148,8 @@ def process_dataset_file(
         duplicate_row_count=duplicate_row_count,
         headers=dict(
             zip(
-                inspection.original_headers,
-                inspection.normalized_headers,
+                repair_result.original_headers,
+                repair_result.normalized_headers,
                 strict=True,
             )
         ),
@@ -149,7 +157,12 @@ def process_dataset_file(
     )
     report_path = output_dir / REPORT_FILE_NAME
     report_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
-    return [parquet_path, report_path, inspection_path]
+    return [
+        parquet_path,
+        report_path,
+        inspection_path,
+        *repair_result.artifacts,
+    ]
 
 
 def _read_sample(input_path: Path, sample_size: int = 65_536) -> tuple[str, str]:

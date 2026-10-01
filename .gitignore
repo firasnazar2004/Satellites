@@ -9,3 +9,5 @@ logs/
 examples/
 
 .DS_Store
+
+tests/pr

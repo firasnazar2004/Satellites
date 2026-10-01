@@ -1,12 +1,47 @@
 """Structured metadata produced by CSV ingestion and cleaning."""
 
 from pathlib import Path
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 
 DateOrder = Literal["dmy", "mdy", "ymd"]
+
+
+class RowStatus(StrEnum):
+    VALID = "VALID"
+    REPAIRED = "REPAIRED"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+class RowRepairRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_line: int
+    record_key: str | None = None
+    status: RowStatus
+    reasons: list[str]
+    original_fields: list[str] | None = None
+    repaired_fields: list[str] | None = None
+
+
+class RepairSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_file: Path
+    repaired_file: Path
+    quarantine_file: Path
+    total_rows: int
+    valid_rows: int
+    repaired_rows: int
+    ambiguous_rows: int
+    original_headers: list[str]
+    normalized_headers: list[str]
+    column_kinds: dict[str, str]
+    primary_key: str | None = None
+    records: list[RowRepairRecord] = Field(default_factory=list)
 
 
 class MalformedRow(BaseModel):

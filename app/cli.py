@@ -55,6 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="How to interpret non-ISO dates (default: dmy)",
     )
     dataset.add_argument(
+        "--trust-date-order",
+        action="store_true",
+        help="Resolve ambiguous day/month dates using --date-order instead of quarantining",
+    )
+    dataset.add_argument(
         "--jobs-root",
         type=Path,
         default=Path("outputs/jobs"),
@@ -112,7 +117,11 @@ def _run_dataset_job(args: argparse.Namespace) -> int:
             args.input,
             jobs_root=args.jobs_root,
         )
-        processor = partial(process_dataset_file, date_order=args.date_order)
+        processor = partial(
+            process_dataset_file,
+            date_order=args.date_order,
+            trust_date_order=args.trust_date_order,
+        )
         job = run_job(job, processor)
     except Exception as exc:
         print(f"Dataset job failed: {exc}", file=sys.stderr)
