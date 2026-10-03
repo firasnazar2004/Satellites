@@ -51,12 +51,15 @@ class FlashcardPipelineTests(unittest.TestCase):
             input_path = root / "biology.txt"
             output_dir = root / "output"
             output_dir.mkdir()
-            input_path.write_text("First section.\n\nSecond section.", encoding="utf-8")
+            input_path.write_text(
+                "First section. " * 30 + "\n\n" + "Second section. " * 30,
+                encoding="utf-8",
+            )
 
             artifacts = process_flashcard_file(
                 input_path,
                 output_dir,
-                max_chunk_chars=16,
+                max_chunk_chars=500,
                 cards_per_chunk=1,
             )
 

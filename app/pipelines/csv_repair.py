@@ -7,6 +7,10 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import combinations
+from itertools import islice
+from functools import lru_cache
+from math import isfinite
+import codecs
 from pathlib import Path
 
 from app.models.dataset import DateOrder, RepairSummary, RowRepairRecord, RowStatus
@@ -55,6 +59,7 @@ def repair_csv_file(
     *,
     date_order: DateOrder,
     trust_date_order: bool = False,
+    record_mode: str = "single_line",
 ) -> RepairResult:
     """Classify every physical row and write only safe rows to repaired CSV."""
 
@@ -64,6 +69,7 @@ def repair_csv_file(
         input_path,
         encoding,
         delimiter,
+        record_mode,
     )
     rules = _infer_rules(header, raw_rows, delimiter, date_order=date_order)
     primary_key_index = _primary_key_index(header, raw_rows, delimiter)
@@ -94,9 +100,11 @@ def repair_csv_file(
 
         for line_number, raw_line in raw_rows:
             fields = _parse_physical_line(raw_line, delimiter)
-            record_key = fields[primary_key_index].strip() if (
-                primary_key_index is not None and len(fields) > primary_key_index
-            ) else None
+            record_key = (
+                fields[primary_key_index].strip()
+                if (primary_key_index is not None and len(fields) > primary_key_index)
+                else None
+            )
             outcome = _repair_row(
                 fields,
                 raw_line=raw_line,
@@ -139,14 +147,18 @@ def repair_csv_file(
                     status = RowStatus.AMBIGUOUS
                     reasons = ["exact duplicate of an earlier accepted row"]
                     repaired_fields = None
-                elif repaired_record_key is not None and repaired_record_key in seen_keys:
+                elif (
+                    repaired_record_key is not None and repaired_record_key in seen_keys
+                ):
                     status = RowStatus.AMBIGUOUS
                     reasons = ["duplicate primary-key value"]
                     repaired_fields = None
 
             reason_text = "; ".join(reasons)
             counts[status.value] += 1
-            status_writer.writerow([line_number, record_key or "", status.value, reason_text])
+            status_writer.writerow(
+                [line_number, record_key or "", status.value, reason_text]
+            )
 
             if repaired_fields is None:
                 quarantine_writer.writerow(
@@ -181,7 +193,9 @@ def repair_csv_file(
         original_headers=original_headers,
         normalized_headers=header,
         column_kinds={rule.name: rule.kind for rule in rules},
-        primary_key=(header[primary_key_index] if primary_key_index is not None else None),
+        primary_key=(
+            header[primary_key_index] if primary_key_index is not None else None
+        ),
         records=records,
     )
     repair_log_path.write_text(summary.model_dump_json(indent=2), encoding="utf-8")
@@ -342,10 +356,15 @@ def _width_candidates(
         if missing > 2:
             return []
         results = []
-        for positions in combinations(range(expected_width), missing):
+        for positions in islice(combinations(range(expected_width), missing), 2001):
+            if len(results) == 2000:
+                return []  # Incomplete search cannot establish uniqueness.
             source = iter(fields)
             inserted = set(positions)
-            candidate = ["" if index in inserted else next(source) for index in range(expected_width)]
+            candidate = [
+                "" if index in inserted else next(source)
+                for index in range(expected_width)
+            ]
             results.append((candidate, f"inserted {missing} missing field(s)"))
         return results
 
@@ -354,7 +373,11 @@ def _width_candidates(
         return []
 
     results = []
-    for boundaries in combinations(range(1, len(fields)), expected_width - 1):
+    for boundaries in islice(
+        combinations(range(1, len(fields)), expected_width - 1), 2001
+    ):
+        if len(results) == 2000:
+            return []
         starts = (0, *boundaries)
         ends = (*boundaries, len(fields))
         candidate = [
@@ -385,7 +408,9 @@ def _infer_rules(
     rules = []
     for index, name in enumerate(header):
         values = [row[index] for row in parsed_rows]
-        nonmissing = [value for value in values if value.casefold() not in MISSING_MARKERS]
+        nonmissing = [
+            value for value in values if value.casefold() not in MISSING_MARKERS
+        ]
         required = bool(values) and len(nonmissing) / len(values) >= 0.98
         kind = _infer_kind(nonmissing, date_order=date_order)
         rule = ColumnRule(name=name, kind=kind, required=required)
@@ -429,10 +454,20 @@ def _infer_kind(values: list[str], *, date_order: DateOrder) -> str:
         return "string"
 
     total = len(values)
-    date_rate = sum(_parse_date(value, date_order=date_order) is not None for value in values) / total
-    integer_rate = sum(_parse_number(value, integer=True) is not None for value in values) / total
-    float_rate = sum(_parse_number(value, integer=False) is not None for value in values) / total
-    boolean_rate = sum(value.casefold() in {"true", "false", "yes", "no"} for value in values) / total
+    date_rate = (
+        sum(_parse_date(value, date_order=date_order) is not None for value in values)
+        / total
+    )
+    integer_rate = (
+        sum(_parse_number(value, integer=True) is not None for value in values) / total
+    )
+    float_rate = (
+        sum(_parse_number(value, integer=False) is not None for value in values) / total
+    )
+    boolean_rate = (
+        sum(value.casefold() in {"true", "false", "yes", "no"} for value in values)
+        / total
+    )
 
     if date_rate >= 0.9:
         return "date"
@@ -464,7 +499,9 @@ def _read_sample(input_path: Path, sample_size: int = 65_536) -> tuple[str, str]
         raise ValueError(f"CSV file is empty: {input_path}")
     encoding = "utf-8-sig" if raw_sample.startswith(b"\xef\xbb\xbf") else "utf-8"
     try:
-        return encoding, raw_sample.decode(encoding)
+        return encoding, codecs.getincrementaldecoder(encoding)().decode(
+            raw_sample, final=False
+        )
     except UnicodeDecodeError as exc:
         raise ValueError("CSV repair currently requires UTF-8 input") from exc
 
@@ -486,7 +523,32 @@ def _read_physical_rows(
     input_path: Path,
     encoding: str,
     delimiter: str,
+    record_mode: str = "single_line",
 ) -> tuple[list[str], list[str], list[tuple[int, str]]]:
+    if record_mode not in {"single_line", "standard"}:
+        raise ValueError("record_mode must be single_line or standard")
+    if record_mode == "standard":
+        with input_path.open(encoding=encoding, newline="") as stream:
+            reader = csv.reader(stream, delimiter=delimiter, strict=True)
+            original_headers = next(reader)
+            raw_rows = []
+            while True:
+                start = reader.line_num + 1
+                try:
+                    row = next(reader)
+                except StopIteration:
+                    break
+                if not row:
+                    continue
+                buffer = io.StringIO(newline="")
+                csv.writer(buffer, delimiter=delimiter, lineterminator="\n").writerow(
+                    row
+                )
+                raw_rows.append((start, buffer.getvalue().rstrip("\r\n")))
+        header = [h.strip() for h in original_headers]
+        if not header or any(not h for h in header) or len(set(header)) != len(header):
+            raise ValueError("CSV requires unique, non-empty headers")
+        return original_headers, header, raw_rows
     with input_path.open("r", encoding=encoding, newline="") as input_file:
         lines = [
             (line_number, line.rstrip("\r\n"))
@@ -505,7 +567,7 @@ def _read_physical_rows(
 
 
 def _parse_physical_line(raw_line: str, delimiter: str) -> list[str]:
-    return next(csv.reader([raw_line], delimiter=delimiter, strict=False))
+    return next(csv.reader(io.StringIO(raw_line), delimiter=delimiter, strict=False))
 
 
 def _has_quote_anomaly(raw_line: str, delimiter: str) -> bool:
@@ -537,7 +599,10 @@ def _has_quote_anomaly(raw_line: str, delimiter: str) -> bool:
     return in_quotes
 
 
+@lru_cache(maxsize=16384)
 def _parse_date(value: str, *, date_order: DateOrder) -> datetime | None:
+    if not re.fullmatch(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}", value):
+        return None
     formats = {
         "dmy": ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d", "%m/%d/%Y"],
         "mdy": ["%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%Y/%m/%d", "%d/%m/%Y"],
@@ -552,7 +617,7 @@ def _parse_date(value: str, *, date_order: DateOrder) -> datetime | None:
 
 
 def _is_ambiguous_day_month(value: str) -> bool:
-    match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", value)
+    match = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})[-/](\d{4})", value)
     if match is None:
         return False
     first, second = int(match.group(1)), int(match.group(2))
@@ -563,7 +628,8 @@ def _parse_number(value: str, *, integer: bool) -> float | None:
     pattern = r"^[+-]?\d+$" if integer else r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$"
     if not re.fullmatch(pattern, value):
         return None
-    return float(value)
+    number = float(value)
+    return number if isfinite(number) else None
 
 
 def _quantile(values: list[float], fraction: float) -> float:

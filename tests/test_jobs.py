@@ -24,7 +24,9 @@ class JobLifecycleTests(unittest.TestCase):
 
             def processor(source: Path, output_dir: Path) -> list[Path]:
                 artifact = output_dir / "result.txt"
-                artifact.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+                artifact.write_text(
+                    source.read_text(encoding="utf-8"), encoding="utf-8"
+                )
                 return [artifact]
 
             result = run_job(job, processor)

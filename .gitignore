@@ -2,12 +2,27 @@
 .env
 __pycache__/
 *.pyc
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
 data/
 outputs/
 logs/
 examples/
 tests/
+checks/
+docs/
+README.md
 .DS_Store
+
+# Local/generated logs and temporary files outside the output directories.
+*.log
+*.tmp
+
+# Vendored Swagger package metadata is not used by the local docs UI.
+app/static/swagger/package.json
 
 tests/pr

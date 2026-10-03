@@ -10,6 +10,14 @@ from pydantic import BaseModel, ConfigDict, Field
 DateOrder = Literal["dmy", "mdy", "ymd"]
 
 
+class SourceProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source: str = Field(min_length=1, max_length=120)
+    date_order: DateOrder = "dmy"
+    trust_date_order: bool = False
+    record_mode: Literal["single_line", "standard"] = "single_line"
+
+
 class RowStatus(StrEnum):
     VALID = "VALID"
     REPAIRED = "REPAIRED"
@@ -25,6 +33,7 @@ class RowRepairRecord(BaseModel):
     reasons: list[str]
     original_fields: list[str] | None = None
     repaired_fields: list[str] | None = None
+    confidence_basis: str = "Not a calibrated probability; exactly one schema-valid candidate is required for repair"
 
 
 class RepairSummary(BaseModel):

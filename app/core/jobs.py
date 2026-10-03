@@ -47,7 +47,9 @@ def run_job(job: Job, processor: Processor) -> Job:
     _save_job(job)
 
     try:
-        artifacts = [path.resolve() for path in processor(job.input_path, job.output_dir)]
+        artifacts = [
+            path.resolve() for path in processor(job.input_path, job.output_dir)
+        ]
         missing = [path for path in artifacts if not path.is_file()]
         if missing:
             raise FileNotFoundError(f"Processor reported missing artifacts: {missing}")
@@ -67,4 +69,6 @@ def run_job(job: Job, processor: Processor) -> Job:
 
 def _save_job(job: Job) -> None:
     record_path = job.output_dir / JOB_RECORD_NAME
-    record_path.write_text(job.model_dump_json(indent=2), encoding="utf-8")
+    temporary = record_path.with_suffix(".json.tmp")
+    temporary.write_text(job.model_dump_json(indent=2), encoding="utf-8")
+    temporary.replace(record_path)

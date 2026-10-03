@@ -2,6 +2,7 @@
 
 import csv
 import io
+import codecs
 from pathlib import Path
 
 import polars as pl
@@ -160,11 +161,11 @@ def _read_sample(input_path: Path, sample_size: int = 65_536) -> tuple[str, str]
 
     encoding = "utf-8-sig" if raw_sample.startswith(b"\xef\xbb\xbf") else "utf-8"
     try:
-        return encoding, raw_sample.decode(encoding)
+        return encoding, codecs.getincrementaldecoder(encoding)().decode(
+            raw_sample, final=False
+        )
     except UnicodeDecodeError as exc:
-        raise ValueError(
-            "CSV must use UTF-8 or UTF-8 with BOM for MVP Step 4"
-        ) from exc
+        raise ValueError("CSV must use UTF-8 or UTF-8 with BOM for MVP Step 4") from exc
 
 
 def _detect_delimiter(sample: str) -> str:
@@ -198,7 +199,9 @@ def _normalize_headers(headers: list[str]) -> list[str]:
     normalized = [header.strip() for header in headers]
     empty_positions = [index + 1 for index, name in enumerate(normalized) if not name]
     if empty_positions:
-        raise ValueError(f"CSV contains empty header names at columns {empty_positions}")
+        raise ValueError(
+            f"CSV contains empty header names at columns {empty_positions}"
+        )
 
     duplicates = sorted({name for name in normalized if normalized.count(name) > 1})
     if duplicates:
@@ -240,7 +243,9 @@ def _infer_and_cast_types(
         date_format = _matching_date_format(series, date_order=date_order)
         if date_format:
             expressions.append(
-                expression.str.strptime(pl.Date, format=date_format, strict=True).alias(name)
+                expression.str.strptime(pl.Date, format=date_format, strict=True).alias(
+                    name
+                )
             )
             date_formats[name] = date_format
         elif _is_boolean_series(series):
@@ -292,4 +297,3 @@ def _has_leading_zero_integer(series: pl.Series) -> bool:
 
 def _all_castable(series: pl.Series, data_type: pl.DataType) -> bool:
     return series.cast(data_type, strict=False).null_count() == 0
-    

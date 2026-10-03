@@ -1,0 +1,7 @@
+{
+  "analyses": [
+    {"test": "descriptive", "columns": ["age"]},
+    {"test": "pearson", "columns": ["age", "score"]}
+  ],
+  "correction": "BH"
+}

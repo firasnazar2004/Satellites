@@ -1,0 +1,2 @@
+# Local compatibility setting for Apple clang 16 with Homebrew R 4.6.
+CC = clang -std=gnu17

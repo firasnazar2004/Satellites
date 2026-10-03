@@ -10,8 +10,8 @@ import polars as pl
 from app.pipelines.dataset import (
     INSPECTION_FILE_NAME,
     inspect_csv,
-    process_dataset_file,
 )
+from app.pipelines.dataset_full import clean_dataset as process_dataset_file
 
 
 class DatasetPipelineTests(unittest.TestCase):
@@ -132,9 +132,7 @@ class DatasetPipelineTests(unittest.TestCase):
             output_dir = root / "output"
             output_dir.mkdir()
             input_path.write_text(
-                "record_id,visit_date\n"
-                "1,31/12/2025\n"
-                "2,03/04/2026\n",
+                "record_id,visit_date\n1,31/12/2025\n2,03/04/2026\n",
                 encoding="utf-8",
             )
 
@@ -161,16 +159,16 @@ class DatasetPipelineTests(unittest.TestCase):
             trusted_frame = pl.read_parquet(trusted_output_dir / "cleaned.parquet")
             self.assertEqual(trusted_frame.height, 2)
 
-    def test_malformed_boundary_quote_is_repaired_when_value_is_unambiguous(self) -> None:
+    def test_malformed_boundary_quote_is_repaired_when_value_is_unambiguous(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             input_path = root / "quotes.csv"
             output_dir = root / "output"
             output_dir.mkdir()
             input_path.write_text(
-                "record_id,note\n"
-                "1,Routine follow-up\n"
-                '2,"Routine follow-up\n',
+                'record_id,note\n1,Routine follow-up\n2,"Routine follow-up\n',
                 encoding="utf-8",
             )
 
