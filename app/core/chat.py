@@ -1,0 +1,241 @@
+"""Async, server-owned streaming chat over the local Ollama HTTP API."""
+
+import asyncio
+import json
+import logging
+import time
+from collections.abc import AsyncIterator, Sequence
+from typing import Any
+
+import httpx
+
+from app.core.chat_config import SYSTEM_PROMPT
+from app.core.heavy_resource import HeavyResource, HeavyResourceLease
+from app.core.llm import DEFAULT_MODEL, OLLAMA_BASE_URL
+from app.models.chat import ChatMessage
+
+logger = logging.getLogger(__name__)
+
+
+class ChatBusyError(Exception):
+    pass
+
+
+class OllamaUnavailableError(Exception):
+    pass
+
+
+class ChatModelUnavailableError(Exception):
+    pass
+
+
+class OllamaProtocolError(Exception):
+    pass
+
+
+def _event(event_type: str, **values: Any) -> bytes:
+    return (
+        json.dumps(
+            {"type": event_type, **values}, ensure_ascii=False, separators=(",", ":")
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+class ChatSession:
+    """One open upstream stream and its heavy-resource lease."""
+
+    def __init__(
+        self,
+        *,
+        model: str,
+        client: httpx.AsyncClient,
+        stream_context: Any,
+        response: httpx.Response,
+        lease: HeavyResourceLease,
+        started_at: float,
+    ):
+        self.model = model
+        self._client = client
+        self._stream_context = stream_context
+        self._response = response
+        self._lease = lease
+        self._started_at = started_at
+        self._closed = False
+
+    async def events(self) -> AsyncIterator[bytes]:
+        """Yield only public assistant text from Ollama's NDJSON response."""
+
+        yield _event("meta", model=self.model)
+        try:
+            async for line in self._response.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise OllamaProtocolError("Ollama returned malformed JSON") from exc
+                if not isinstance(payload, dict):
+                    raise OllamaProtocolError("Ollama returned an unexpected event")
+                if payload.get("error"):
+                    raise OllamaProtocolError("Ollama reported a generation error")
+
+                # Qwen/Ollama may expose thinking, reasoning, or analysis fields.
+                # Deliberately read only the public assistant content field.
+                message = payload.get("message")
+                if message is not None and not isinstance(message, dict):
+                    raise OllamaProtocolError("Ollama returned an unexpected message")
+                content = message.get("content") if message else None
+                if content:
+                    if not isinstance(content, str):
+                        raise OllamaProtocolError(
+                            "Ollama returned invalid text content"
+                        )
+                    yield _event("token", content=content)
+                if payload.get("done") is True:
+                    yield _event("done")
+                    logger.info(
+                        "chat completed duration_seconds=%.3f",
+                        time.monotonic() - self._started_at,
+                    )
+                    return
+            raise OllamaProtocolError("Ollama ended the response before completion")
+        except asyncio.CancelledError:
+            logger.info(
+                "chat cancelled duration_seconds=%.3f",
+                time.monotonic() - self._started_at,
+            )
+            raise
+        except Exception:
+            logger.exception("chat upstream failure")
+            yield _event("error", detail="The local model became unavailable.")
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._stream_context.__aexit__(None, None, None)
+        finally:
+            try:
+                await self._client.aclose()
+            finally:
+                self._lease.release()
+
+
+class ChatService:
+    """Prepare validated local-model streams while owning resource cleanup."""
+
+    def __init__(
+        self,
+        *,
+        model: str = DEFAULT_MODEL,
+        base_url: str = OLLAMA_BASE_URL,
+        resource: HeavyResource | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
+        self.model = model
+        self.base_url = base_url
+        self.resource = resource or HeavyResource()
+        self.transport = transport
+
+    async def open(self, messages: Sequence[ChatMessage]) -> ChatSession:
+        """Acquire capacity and connect upstream before FastAPI starts HTTP 200."""
+
+        started_at = time.monotonic()
+        lease = self.resource.acquire(blocking=False)
+        if lease is None:
+            logger.info("chat rejected because server busy")
+            raise ChatBusyError
+
+        timeout = httpx.Timeout(connect=3.0, read=None, write=30.0, pool=3.0)
+        client = httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout,
+            trust_env=False,
+            transport=self.transport,
+        )
+        stream_context = None
+        stream_open = False
+        try:
+            await self._ensure_model_available(client)
+            upstream_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                *(message.model_dump() for message in messages),
+            ]
+            stream_context = client.stream(
+                "POST",
+                "/api/chat",
+                json={
+                    "model": self.model,
+                    "messages": upstream_messages,
+                    "stream": True,
+                    "think": False,
+                    "options": {
+                        "temperature": 0.7,
+                        "num_ctx": 4096,
+                        "num_predict": 1800,
+                    },
+                    "keep_alive": "2m",
+                },
+            )
+            response = await stream_context.__aenter__()
+            stream_open = True
+            if response.status_code == 404:
+                raise ChatModelUnavailableError
+            if response.status_code >= 500:
+                raise OllamaUnavailableError
+            if not response.is_success:
+                raise OllamaProtocolError(
+                    f"Unexpected Ollama status {response.status_code}"
+                )
+            logger.info(
+                "chat request started message_count=%d total_input_characters=%d",
+                len(messages),
+                sum(len(message.content) for message in messages),
+            )
+            return ChatSession(
+                model=self.model,
+                client=client,
+                stream_context=stream_context,
+                response=response,
+                lease=lease,
+                started_at=started_at,
+            )
+        except BaseException as exc:
+            try:
+                if stream_open:
+                    await stream_context.__aexit__(None, None, None)
+            finally:
+                try:
+                    await client.aclose()
+                finally:
+                    lease.release()
+            if isinstance(exc, httpx.RequestError):
+                raise OllamaUnavailableError from exc
+            raise
+
+    async def _ensure_model_available(self, client: httpx.AsyncClient) -> None:
+        try:
+            response = await client.get("/api/tags")
+        except httpx.RequestError as exc:
+            raise OllamaUnavailableError from exc
+        if response.status_code >= 500:
+            raise OllamaUnavailableError
+        if not response.is_success:
+            raise OllamaProtocolError(
+                f"Unexpected Ollama status {response.status_code}"
+            )
+        try:
+            models = response.json()["models"]
+            names = {
+                value
+                for item in models
+                if isinstance(item, dict)
+                for value in (item.get("name"), item.get("model"))
+                if isinstance(value, str)
+            }
+        except (ValueError, KeyError, TypeError) as exc:
+            raise OllamaProtocolError("Ollama returned an invalid model list") from exc
+        if self.model not in names:
+            raise ChatModelUnavailableError

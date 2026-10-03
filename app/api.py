@@ -10,21 +10,33 @@ from pathlib import Path
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
+from app.core.chat import (
+    ChatBusyError,
+    ChatModelUnavailableError,
+    ChatService,
+    OllamaProtocolError,
+    OllamaUnavailableError,
+)
+from app.core.research_artifacts import research_artifacts, research_quality
 from app.core.service import JobService
 from app.models.analysis import AnalysisPlan
-from app.models.job import PipelineType
+from app.models.chat import ChatRequest
 from app.models.dataset import SourceProfile
+from app.models.job import PipelineType
 from app.models.research import JobResponse
-from app.core.research_artifacts import research_artifacts, research_quality
 
 key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+class NDJSONStreamingResponse(StreamingResponse):
+    media_type = "application/x-ndjson"
 
 
 def authorize(key: Annotated[str | None, Depends(key_header)]):
@@ -33,8 +45,9 @@ def authorize(key: Annotated[str | None, Depends(key_header)]):
         raise HTTPException(401, "Invalid API key")
 
 
-def create_app(storage: Path | None = None):
+def create_app(storage: Path | None = None, chat_service: ChatService | None = None):
     root = storage or Path(os.environ.get("LOCAL_AI_STORAGE", "outputs/api"))
+    chat_service = chat_service if chat_service is not None else ChatService()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -159,6 +172,46 @@ def create_app(storage: Path | None = None):
             return response(app.state.service.submit(pipeline, path, options))
         finally:
             await file.close()
+
+    @app.post(
+        "/chat/stream",
+        dependencies=[Depends(authorize)],
+        tags=["Chat"],
+        description="Stream a stateless response from the server's local qwen3:8b model as NDJSON.",
+        response_class=NDJSONStreamingResponse,
+        responses={
+            409: {"description": "The heavy-compute resource is busy"},
+            502: {"description": "Ollama returned an unexpected response"},
+            503: {"description": "Ollama or qwen3:8b is unavailable"},
+        },
+    )
+    async def chat(payload: ChatRequest, request: Request):
+        try:
+            session = await chat_service.open(payload.messages)
+        except ChatBusyError as exc:
+            raise HTTPException(
+                409, "The local AI server is busy processing another task"
+            ) from exc
+        except ChatModelUnavailableError as exc:
+            raise HTTPException(503, "qwen3:8b is unavailable") from exc
+        except OllamaUnavailableError as exc:
+            raise HTTPException(503, "Ollama is unavailable") from exc
+        except OllamaProtocolError as exc:
+            raise HTTPException(502, "Ollama returned an unexpected response") from exc
+
+        async def stream():
+            try:
+                async for event in session.events():
+                    if await request.is_disconnected():
+                        return
+                    yield event
+            finally:
+                await session.aclose()
+
+        return NDJSONStreamingResponse(
+            stream(),
+            headers={"Cache-Control": "no-cache"},
+        )
 
     @app.post(
         "/pipelines/flashcards",
