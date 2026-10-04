@@ -7,18 +7,21 @@ from app.pipelines.research_sources import EXCLUDED
 
 NUMBER = r"[+−-]?(?:\d+(?:[.,]\d+)*|\.\d+)(?:[eE][+−-]?\d+)?"
 NUMERIC_CATEGORIES = {"sample_size", "denominator", "percentage", "test_statistic",
-                      "p_value", "confidence_interval", "effect_size", "diagnostic_accuracy"}
+                      "degrees_freedom", "p_value", "confidence_interval", "effect_size",
+                      "diagnostic_accuracy"}
 UNITS = r"patients?|participants?|subjects?|adults?|children|cases?|records?|files?|studies|trials|samples?|observations?|respondents?|neurons?|images?|datasets?"
 MEASURES = {
-    "sample_size": rf"(?:\b[Nn]\s*=\s*\d+|\b\d+[\s-]+(?:{UNITS})\b|\b\d+\s+(?:fit|met|included|eligible)\b|(?:sample size|enroll\w*|recruit\w*)[^.;]{{0,60}}?\d+)",
-    "denominator": rf"(?:\b(?:of|among|out of|total(?: of)?|total count(?: of)?|total number(?: of)?)\s+\d+[\s-]+(?:{UNITS})\b|\b\d+\s*/\s*\d+|denominator\s*(?:of|=|:)\s*\d+)",
+    "sample_size": rf"(?:\b[Nn]\s*=\s*\d+|\b\d+[\s-]+(?:{UNITS})\b|\b\d+\s+(?:[A-Za-z][\w-]*\s+){{0,3}}(?:{UNITS})\b|\b\d+\s+(?:fit|met|included|eligible)\b|(?:sample size|enroll\w*|recruit\w*)[^.;]{{0,60}}?\d+)",
+    "denominator": rf"(?:\b(?:of|among|out of|total(?: of)?|total count(?: of)?|total number(?: of)?)\s+\d+[\s-]+(?:{UNITS})\b|\btotal\s+(?:count|number)\s+of\s+(?:[A-Za-z-]+\s+){{0,3}}(?:{UNITS})\b[^.;]{{0,80}}?{NUMBER}|\b\d+\s*/\s*\d+|denominator\s*(?:of|=|:)\s*\d+)",
     "percentage": rf"{NUMBER}\s*(?:%|percent\b|per cent\b)",
     "p_value": rf"\b[pP](?:[- ]values?)?\s*(?:=|<=|>=|<|>|≤|≥|was|is|of)\s*{NUMBER}",
     "confidence_interval": rf"(?:\b(?:\d+(?:\.\d+)?\s*%\s*)?(?:confidence interval|CI)\b\s*(?:[:=]|was|is|of)?\s*[\[(]?\s*{NUMBER}\s*(?:,|;|to|[-–—])\s*{NUMBER})",
     "test_statistic": rf"(?:\b(?:chi[- ]?square(?:d)?|Pearson\s+Chi[- ]?Square|Likelihood\s+Ratio|χ[²2]?|chi2|[tFz])\b(?:\s*\([^)]{{1,35}}\))?(?:\s*\|\s*Value)?\s*[:=]\s*{NUMBER})",
+    "degrees_freedom": rf"(?:\bdf\s*[:=]\s*{NUMBER}|\bdegrees?\s+of\s+freedom\s*[:=]?\s*{NUMBER})",
     "effect_size": rf"(?:Cohen[’']?s?\s*d|Hedges[’']?\s*g|odds ratio|risk ratio|hazard ratio|mean difference|Cram[eé]r[’']?s?\s*V|eta[- ]squared|epsilon[- ]squared|rank[- ]biserial|R[²2]|\br\b|\brho\b|\bOR\b|\bRR\b|\bHR\b)\s*(?:was|is|of|=|:)\s*{NUMBER}",
     "diagnostic_accuracy": rf"(?:(?:sensitivity|specificity|accuracy|AUC|positive predictive value|negative predictive value)\s*(?:was|is|of|=|:)?\s*{NUMBER}\s*%?|{NUMBER}\s*%\s*(?:sensitivity|specificity|accuracy))",
 }
+MEASURES["statistical_warning"] = r"\b(?:expected count|expected cell|minimum expected|cells?\s+have\s+expected|assumption|sparse cells?|small expected frequencies)\b[^.;]{0,180}"
 CITED = re.compile(r"\bet\s*al\b|\b(?:previous|prior|earlier|another|other)\s+(?:stud(?:y|ies)|trial|research)|\b(?:according to|reported by)\b", re.I)
 OWN = re.compile(r"\b(?:we|our|this study|present study|this paper|this review|we propose|we prove)\b", re.I)
 
@@ -55,10 +58,67 @@ def _context_window(text, start, end, width=180):
     return text[left:right].strip()
 
 
-def validate_proposal(item, passage, *, source, evidence_id, document_type):
+def _explicit_eligibility_pair(text):
+    """Read a source-stated total-to-eligible count without calculating values."""
+    link = re.search(
+        r"\btotal\s+(?:count|number)\s+of\b[^.;]{0,120}?(?P<ofwhom>\bof\s+whom\b)"
+        r"[^.;]{0,120}?\b(?:fit|met|satisfied)\b[^.;]{0,80}?\b(?:inclusion|exclusion|selection)\s+criteria\b",
+        text, re.I)
+    if not link:
+        return None
+    units = rf"(?:{UNITS})"
+    before = text[link.start():link.start("ofwhom")]
+    after = text[link.end("ofwhom"):link.end()]
+    totals = list(re.finditer(rf"{NUMBER}\s+{units}\b", before, re.I))
+    eligible = re.search(rf"{NUMBER}(?:\s+{units}\b)?", after, re.I)
+    if not totals or not eligible:
+        return None
+    return totals[-1].group(), eligible.group()
+
+
+GROUP_LABEL = re.compile(
+    r"\b(?P<label>women|woman|females?|girls?|men|man|males?|boys?|"
+    r"children|adolescents?|adults?|older adults?|elderly|patients?|controls?|"
+    r"cases?|treated group|control group)\b", re.I)
+
+
+def _explicit_subgroup(text, span):
+    """Bind a subgroup only when nearby source wording connects it to the value."""
+    prefix = text[max(0, span[0] - 120):span[0]]
+    found = None
+    for match in GROUP_LABEL.finditer(prefix):
+        connector = prefix[match.end():]
+        if len(connector) <= 55 and re.search(
+                r"\b(?:had|was|were|at|reported|showed|constituting|constituted|"
+                r"accounted\s+for|prevalence|rate|proportion)\b|[:=]", connector, re.I):
+            found = match.group()
+    return found
+
+
+def validate_proposal(item, passage, *, source, evidence_id, document_type, span_bounds=None):
     reasons = []
     text, category = passage.text, item.category
-    span = literal_span(item.value, text)
+    if span_bounds:
+        fragment_start, fragment_end = span_bounds
+        fragment_end = min(fragment_end, len(text))
+        local_span = literal_span(item.value, text[fragment_start:fragment_end])
+        span = ((fragment_start + local_span[0], fragment_start + local_span[1])
+                if local_span else None)
+    else:
+        fragment_start, fragment_end = 0, len(text)
+        span = literal_span(item.value, text)
+    # A labelled source pool followed by an explicit eligible subset has two
+    # different roles. Classify the first count as a denominator only when the
+    # source states both the total group and an ``of whom ... criteria`` link.
+    link_match = re.search(
+        r"\btotal\s+(?:count|number)\s+of\b[^.;]{0,120}?(?P<ofwhom>\bof\s+whom\b)"
+        r"[^.;]{0,120}?\b(?:fit|met|satisfied)\b[^.;]{0,80}?\b(?:inclusion|exclusion|selection)\s+criteria\b",
+        text, re.I)
+    eligibility_pair = _explicit_eligibility_pair(text)
+    if (category == "sample_size" and span and link_match
+            and span[1] <= link_match.start("ofwhom")):
+        item = item.model_copy(update={"category": "denominator"})
+        category = "denominator"
     if span is None:
         reasons.append("value_not_literal_in_selected_passage")
     if passage.section in EXCLUDED:
@@ -95,7 +155,8 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
         # The value must touch the labelled measure; an unrelated number elsewhere
         # in the paragraph cannot borrow a label or a significance symbol.
         item_numbers = set(numerical_tokens(item.value))
-        supported_matches = [m for m in matches if span and m.start() < span[1]
+        supported_matches = [m for m in matches if span and m.start() >= fragment_start
+                             and m.end() <= fragment_end and m.start() < span[1]
                              and m.end() > span[0]
                              and item_numbers & set(numerical_tokens(m.group()))]
         supported_numbers = {number for m in supported_matches for number in numerical_tokens(m.group())
@@ -103,7 +164,7 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
         # Parenthetical labels such as ``(2-sided)`` are not additional
         # p-values. The validated p-value is the final numeric token in the
         # explicitly labelled measure.
-        if category == "p_value":
+        if category in {"p_value", "degrees_freedom"}:
             supported_numbers = {tokens[-1] for match in supported_matches
                                  if (tokens := numerical_tokens(match.group()))}
         if not supported_matches:
@@ -134,6 +195,8 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
         "limitation": r"\b(?:limitation|limited|missing|bias|caution|uncertain|not recorded|not measured|small sample|expected count|cannot|could not|not generaliz|not generalis)",
         "population": rf"\b(?:{UNITS}|population|clinic|athlete|setting|eligib|inclusion|exclusion)\b",
     }
+    if category == "statistical_warning" and not re.search(MEASURES[category], item.value, re.I):
+        reasons.append("statistical_warning_requires_explicit_caveat_wording")
     if category in checks and not re.search(checks[category], item.value, re.I):
         reasons.append("category_not_supported_by_selected_value")
     if category == "metadata" and passage.page > 2 and passage.section != "front_matter":
@@ -176,7 +239,32 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
         warnings.append("Table measures use explicit labels; header association and footnotes require review")
     if re.search(r"strong\s+association|caus(?:e|ed|al)|risk factor", text, re.I):
         warnings.append("Author wording retained; p-values do not establish strength or causality")
-    return GroundedEvidence(**item.model_dump(), id=evidence_id, source=source,
+    measure = None
+    if category in NUMERIC_CATEGORIES:
+        from app.models.research import ReportedMeasure
+        match = supported_matches[0] if supported_matches else None
+        explicit_denominator = explicit_subgroup = None
+        if eligibility_pair and category in {"sample_size", "denominator"}:
+            total_value, eligible_value = eligibility_pair
+            item_numbers = set(numerical_tokens(item.value))
+            if category == "sample_size" and item_numbers & set(numerical_tokens(eligible_value)):
+                explicit_denominator = total_value
+            elif category == "denominator" and item_numbers & set(numerical_tokens(total_value)):
+                explicit_subgroup = eligible_value
+        literal_subgroup = (_explicit_subgroup(text, span)
+                            if span and category in {"sample_size", "denominator", "percentage",
+                                                     "diagnostic_accuracy"} else None)
+        explicit_subgroup = explicit_subgroup or literal_subgroup
+        has_explicit_relation = bool(explicit_denominator or explicit_subgroup)
+        measure = ReportedMeasure(role=category, exact_text=match.group() if match else item.value,
+            label=(match.group(0).split(":", 1)[0].split("=", 1)[0].strip()
+                   if match and (":" in match.group() or "=" in match.group()) else None),
+            operator=next((op for op in ("<=", ">=", "≤", "≥", "<", ">", "=")
+                           if match and op in match.group()), "reported"),
+            denominator=explicit_denominator, subgroup=explicit_subgroup,
+            relation_source_ids=[passage.id] if has_explicit_relation else [],
+            relation_status="explicit" if has_explicit_relation else "unresolved")
+    return GroundedEvidence(**item.model_dump(), measure=measure, id=evidence_id, source=source,
         page=passage.page, section=passage.section, source_kind=passage.kind, quote=text,
         value_start=span[0], value_end=span[1], context_ids=passage.context_ids,
         context_text=_context_window(text, span[0], span[1]),

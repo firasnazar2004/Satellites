@@ -10,6 +10,7 @@ Section = Literal["front_matter", "abstract", "introduction", "methods", "result
                   "appendices", "excluded", "unknown"]
 Category = Literal["metadata", "objective", "study_design", "population",
                    "sample_size", "denominator", "percentage", "test_statistic",
+                   "degrees_freedom", "statistical_warning",
                    "p_value", "confidence_interval", "effect_size",
                    "diagnostic_accuracy", "finding", "limitation", "conclusion"]
 Origin = Literal["current_study", "cited_study", "background"]
@@ -32,7 +33,7 @@ class SourcePassage(BaseModel):
 
 class EvidenceProposal(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    passage_id: str = Field(min_length=1, max_length=40)
+    passage_id: str = Field(min_length=1, max_length=80)
     category: Category
     # A short literal measure/phrase, never a model-written quotation or calculation.
     value: str = Field(min_length=1, max_length=240)
@@ -71,6 +72,7 @@ class GroundedEvidence(EvidenceProposal):
     value_end: int
     context_ids: list[str] = Field(default_factory=list)
     context_text: str = Field(default="", max_length=1200)
+    measure: "ReportedMeasure | None" = None
     extraction_method: Literal[
         "model", "targeted_model", "deterministic_recovery",
         "deterministic_numeric_recovery",
@@ -78,9 +80,37 @@ class GroundedEvidence(EvidenceProposal):
     warnings: list[str] = Field(default_factory=list)
 
 
+class ReportedMeasure(BaseModel):
+    """Exact reported value plus only source-explicit relationships."""
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["sample_size", "denominator", "percentage", "test_statistic",
+                  "degrees_freedom", "p_value", "confidence_interval", "effect_size",
+                  "diagnostic_accuracy"]
+    exact_text: str = Field(min_length=1, max_length=240)
+    label: str | None = Field(default=None, max_length=100)
+    operator: Literal["=", "<", ">", "<=", ">=", "≤", "≥", "range", "reported"] = "reported"
+    units: str | None = Field(default=None, max_length=80)
+    population: str | None = Field(default=None, max_length=240)
+    subgroup: str | None = Field(default=None, max_length=160)
+    denominator: str | None = Field(default=None, max_length=160)
+    relation_source_ids: list[str] = Field(default_factory=list, max_length=6)
+    relation_status: Literal["explicit", "unresolved", "not_applicable"] = "unresolved"
+
+
+GroundedEvidence.model_rebuild()
+
+
+class StageOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["completed", "partial", "failed", "not_run"] = "not_run"
+    reason: str | None = None
+    input_ids: list[str] = Field(default_factory=list, max_length=50)
+    output_ids: list[str] = Field(default_factory=list, max_length=50)
+
+
 class ResearchOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    schema_version: str = "2.2"
+    schema_version: str = "2.3"
     status: Literal["completed", "partial", "failed"]
     processing_status: Literal["completed", "failed"] = "completed"
     processing_error: str | None = None
@@ -96,6 +126,9 @@ class ResearchOutcome(BaseModel):
     rejected_attempts: int = 0
     selected_records: int = 0
     extraction_complete: bool = False
+    report_availability: Literal["available", "partial", "unavailable"] = "unavailable"
+    report_kind: Literal["validated_report", "partial_report", "limited_overview", "unavailable"] = "unavailable"
+    stage_outcomes: dict[str, StageOutcome] = Field(default_factory=dict)
 
 
 class CitedClaim(BaseModel):
@@ -103,6 +136,16 @@ class CitedClaim(BaseModel):
     text: str = Field(min_length=8, max_length=700)
     evidence_ids: list[str] = Field(min_length=1, max_length=4)
     source_ids: list[str] = Field(min_length=1, max_length=6)
+
+
+class CitedClaimSet(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    claims: list[CitedClaim] = Field(default_factory=list, max_length=8)
+
+
+class IntroductionRepair(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    claim: CitedClaim | None = None
 
 
 class ResearchNarrative(BaseModel):

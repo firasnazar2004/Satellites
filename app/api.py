@@ -24,7 +24,7 @@ from app.core.chat import (
     OllamaProtocolError,
     OllamaUnavailableError,
 )
-from app.core.llm import DEFAULT_MODEL, OLLAMA_BASE_URL
+from app.core.llm import DEFAULT_MODEL, OLLAMA_BASE_URL, RESEARCH_MODEL
 from app.core.research_artifacts import research_artifacts, research_quality
 from app.core.service import JobService
 from app.models.analysis import AnalysisPlan
@@ -122,12 +122,17 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
                     .json()
                     .get("models", [])
                 )
-            qwen = any(m["name"] == DEFAULT_MODEL for m in models)
+            available = {m.get("name") for m in models}
+            qwen = DEFAULT_MODEL in available
+            research_available = RESEARCH_MODEL in available
         except Exception:
             qwen = False
+            research_available = False
         return {
             "api": "ok",
             "qwen3_8b_available": qwen,
+            "research_model": RESEARCH_MODEL,
+            "research_model_available": research_available,
             "Rscript": bool(shutil.which("Rscript")),
             "worker_count": 1,
         }

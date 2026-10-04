@@ -136,6 +136,28 @@ def heading_section(text):
     return None
 
 
+def section_transition(current, detected, page_number):
+    """Keep labelled subsections inside an opening structured abstract."""
+    if current == "abstract" and page_number <= 3 and detected in {
+            "methods", "results", "discussion", "conclusions", "limitations"}:
+        return "abstract"
+    return detected or current
+
+
+def interleave_table_passages(text_passages, table_passages, gutters=()):
+    """Place ruled table rows among text in single-column page reading order."""
+    passages = list(text_passages) + list(table_passages)
+    if gutters:
+        return passages, "Table passages retained after column text; verify table reading order"
+    passages.sort(key=lambda item: (
+        item.get("bbox", (0, 0, 0, 0))[1],
+        1 if item.get("kind") == "table" else 0,
+        int(re.search(r"-R(\d+)$", item["id"]).group(1))
+            if re.search(r"-R(\d+)$", item["id"]) else 0,
+    ))
+    return passages, None
+
+
 def normalize_text(raw):
     text = raw.translate(LIGATURES).replace("\u00a0", " ")
     # Join alphabetic line-end hyphens only; retain the hyphen. Thus neither
@@ -280,7 +302,8 @@ def extract_pages(path, *, passage_chars=900, reading_order="auto"):
                 line_records.append(line)
                 if margin or numbered:
                     continue
-                new_section = None if front_listing else heading_section(raw)
+                detected_section = None if front_listing else heading_section(raw)
+                new_section = section_transition(section, detected_section, number)
                 gap = box[1]-current[-1]["bbox"][3] if current else 0
                 if current and (new_section or gap > height*.85 or gap < -height or
                                 abs(box[0]-current[-1]["bbox"][0]) > page.width*.2):
@@ -364,6 +387,13 @@ def extract_pages(path, *, passage_chars=900, reading_order="auto"):
                 # them explicitly so selection and synthesis cannot separate a
                 # result from an expected-count or similar interpretation caveat.
                 passages.extend(link_table_context(table_passages))
+            if table_records:
+                text_passages = [item for item in passages if item.get("kind") != "table"]
+                table_passages = [item for item in passages if item.get("kind") == "table"]
+                passages, order_warning = interleave_table_passages(
+                    text_passages, table_passages, gutters)
+                if order_warning:
+                    warnings.append(order_warning)
             normalized_page = "\n\n".join([b["text"] for b in blocks] +
                 ["\n".join(" | ".join(normalize_text(c or "") for c in row)
                            for row in t["rows"]) for t in table_records])

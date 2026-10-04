@@ -136,6 +136,16 @@ def _run_pipeline(pipeline, args, options):
     except Exception as exc:
         print(f"{pipeline.value} job failed: {exc}", file=sys.stderr)
         if job is not None:
+            if pipeline == PipelineType.RESEARCH:
+                from app.core.research_artifacts import research_quality
+
+                quality = research_quality(job)
+                if quality:
+                    print(f"Research quality: {quality.status}", file=sys.stderr)
+                    print(f"Processing: {quality.processing_status}", file=sys.stderr)
+                    print(f"Report: {quality.report_kind} ({quality.report_availability})",
+                          file=sys.stderr)
+                    print(f"Extraction complete: {quality.extraction_complete}", file=sys.stderr)
             print(
                 f"Failure details: {job.output_dir / 'job.json'}",
                 file=sys.stderr,
@@ -151,6 +161,8 @@ def _run_pipeline(pipeline, args, options):
         quality = research_quality(job)
         if quality:
             print(f"Research quality: {quality.status}")
+            print(f"Report: {quality.report_kind} ({quality.report_availability})")
+            print(f"Extraction complete: {quality.extraction_complete}")
             for reason in quality.missing_coverage + quality.reasons:
                 print(f"- {reason}")
             if quality.status != "completed":

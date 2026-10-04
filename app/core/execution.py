@@ -58,6 +58,10 @@ def execute(pipeline: str, source: Path, output: Path, options: dict) -> list[Pa
             if (output / "error.txt").exists()
             else "Pipeline process failed; see worker.log"
         )
+        # worker.error.txt already records the original exception type. Strip
+        # that one layer before run_job adds the lifecycle-level type prefix.
+        if message.startswith("RuntimeError: "):
+            message = message.removeprefix("RuntimeError: ")
         raise RuntimeError(message)
     return [Path(p) for p in json.loads((output / "artifacts.json").read_text())] + [
         config,

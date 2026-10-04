@@ -12,14 +12,14 @@ RESEARCH_ARTIFACTS = (
 )
 NUMERIC_CATEGORIES = {
     "sample_size", "denominator", "percentage", "test_statistic", "p_value",
-    "confidence_interval", "effect_size", "diagnostic_accuracy",
+    "degrees_freedom", "confidence_interval", "effect_size", "diagnostic_accuracy",
 }
 RESULT_CATEGORIES = {
     "finding", "percentage", "test_statistic", "p_value", "confidence_interval",
     "effect_size", "diagnostic_accuracy",
 }
 NUMBER_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9.])[+−-]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?(?![A-Za-z0-9%])"
+    r"(?<![A-Za-z0-9.])[+−-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?(?![A-Za-z0-9%])"
 )
 NUMBER_WORD = re.compile(
     r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
@@ -30,13 +30,35 @@ NUMBER_WORD = re.compile(
 CONTENT_WORD = re.compile(r"[A-Za-z][A-Za-z-]{2,}")
 STOP_WORDS = {"the", "and", "for", "that", "this", "with", "from", "were", "was",
               "study", "paper", "result", "results", "found", "reported", "within"}
+GROUP_ALIASES = {
+    "woman": "female", "women": "female", "girl": "female", "girls": "female",
+    "female": "female", "females": "female", "man": "male", "men": "male",
+    "boy": "male", "boys": "male", "male": "male", "males": "male",
+    "adult": "adult", "adults": "adult", "child": "child", "children": "child",
+    "adolescent": "adolescent", "adolescents": "adolescent", "patient": "patient",
+    "patients": "patient", "control": "control", "controls": "control",
+}
+GROUP_TERM = re.compile(r"\b(?:women?|females?|girls?|men|males?|boys?|placebo|controls?)\b", re.I)
+
+
+def _group_terms(text):
+    return {GROUP_ALIASES.get(match.group().casefold(), match.group().casefold())
+            for match in GROUP_TERM.finditer(text)}
 
 
 def _unsupported_figures(claim, evidence):
     """Return figures/number words not literally supported by cited numeric records."""
-    cited_values = [evidence[evidence_id]["value"] for evidence_id in claim.evidence_ids
-                    if evidence_id in evidence
-                    and evidence[evidence_id]["category"] in NUMERIC_CATEGORIES]
+    cited_items = [evidence[evidence_id] for evidence_id in claim.evidence_ids
+                   if evidence_id in evidence and evidence[evidence_id]["category"]
+                   in NUMERIC_CATEGORIES | {"statistical_warning"}]
+    cited_values = [item["value"] for item in cited_items]
+    for item in cited_items:
+        measure = item.get("measure") or {}
+        cited_values.append(measure.get("exact_text", ""))
+        relation_sources = set(measure.get("relation_source_ids", []))
+        if (measure.get("relation_status") == "explicit" and relation_sources
+                and relation_sources <= set(claim.source_ids)):
+            cited_values.extend((measure.get("denominator") or "", measure.get("subgroup") or ""))
     allowed = {
         match.group().casefold() for value in cited_values for match in NUMBER_TOKEN.finditer(value)
     }
@@ -74,28 +96,76 @@ def select_evidence(records, document_type, limit=9):
                 bool(e.context_text), e.source_kind == "text", -e.page, -len(e.quote))
 
     ranked = sorted(candidates, key=rank, reverse=True)
-    selected, used, per_page, per_passage = [], set(), Counter(), Counter()
+    selected, used, per_passage = [], set(), Counter()
 
-    def add(record):
+    def add(record, *, bundle=False):
         key = (record.passage_id, record.category, record.value, record.context_text)
-        if key in used or len(selected) >= limit or per_passage[record.passage_id] >= 2:
+        passage_limit = 5 if bundle or record.category in {
+            "test_statistic", "p_value", "degrees_freedom", "statistical_warning"} else 2
+        if key in used or len(selected) >= limit or per_passage[record.passage_id] >= passage_limit:
             return
         used.add(key)
         selected.append(record)
-        per_page[record.page] += 1
         per_passage[record.passage_id] += 1
 
-    for categories in (("objective",), ("study_design",), ("population",),
-                       ("sample_size", "denominator"),
-                       tuple(RESULT_CATEGORIES),
-                       ("test_statistic", "effect_size", "confidence_interval"),
-                       ("p_value",),
-                       ("conclusion",), ("limitation",)):
-        candidate = next((e for e in ranked if e.category in categories), None)
-        if candidate:
-            add(candidate)
+    # Keep the best explicit question first, then select central results with
+    # their directly linked statistical/denominator context as compact bundles.
+    objective = next((e for e in ranked if e.category == "objective"), None)
+    if objective:
+        add(objective)
+    inferential = [e for e in ranked if e.category in {
+        "test_statistic", "p_value", "degrees_freedom", "statistical_warning"}]
+    processed_inferential = set()
+    for record in inferential:
+        if record.id in processed_inferential:
+            continue
+        if len(selected) >= max(1, limit - 4):
+            break
+        add(record, bundle=True)
+        linked_ids = set(getattr(record, "context_ids", []) or []) | {record.passage_id}
+        for companion in inferential:
+            if companion is record:
+                continue
+            if companion.passage_id in linked_ids or record.passage_id in (
+                    getattr(companion, "context_ids", []) or []):
+                add(companion, bundle=True)
+                processed_inferential.add(companion.id)
+        processed_inferential.add(record.id)
+    central = [e for e in ranked if e.category in RESULT_CATEGORIES
+               and e.section in {"abstract", "results", "discussion", "conclusions"}
+               and e not in selected]
+    supporting_categories = {"study_design", "population", "sample_size", "denominator",
+                            "conclusion", "limitation"}
+    supporting_available = sum(1 for item in ranked if item.category in supporting_categories)
+    seed_limit = max(1, min(3, limit - len(selected) - supporting_available))
+    seeds = []
+    for record in central:
+        if record.passage_id in {item.passage_id for item in seeds}:
+            continue
+        add(record)
+        if record in selected:
+            seeds.append(record)
+        if len(seeds) >= seed_limit:
+            break
+    for record in seeds:
+        linked_ids = set(getattr(record, "context_ids", []) or []) | {record.passage_id}
+        companions = [item for item in ranked if item is not record and
+            item.category in {"sample_size", "denominator", "test_statistic", "p_value",
+                              "degrees_freedom", "statistical_warning", "confidence_interval",
+                              "effect_size", "diagnostic_accuracy"} and
+            (item.passage_id in linked_ids or record.passage_id in
+             (getattr(item, "context_ids", []) or []))]
+        for companion in companions:
+            add(companion, bundle=True)
+
+    # Fill remaining capacity by objective relevance and document coverage.
+    supporting = {"study_design", "population", "sample_size", "denominator",
+                  "conclusion", "limitation", "degrees_freedom", "statistical_warning"}
     for record in ranked:
-        if record.category != "metadata" and per_page[record.page] < 3:
+        if record.category in supporting:
+            add(record, bundle=record.category in {"degrees_freedom", "statistical_warning"})
+    for record in ranked:
+        if record.category != "metadata":
             add(record)
     return selected
 
@@ -120,6 +190,13 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
             and e.section in {"abstract", "results", "discussion", "conclusions"}
             and e.category in RESULT_CATEGORIES
             for e in reportable
+        ),
+        "objective_result_linked": any(
+            bool(_terms(objective.value + " " + objective.quote) &
+                 _terms(result.context_text or result.quote))
+            for objective in own if objective.category == "objective"
+            for result in reportable if result.category in RESULT_CATEGORIES
+            and result.section in {"abstract", "results", "discussion", "conclusions"}
         ),
     }
     applicable = {
@@ -157,6 +234,8 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
     if not processing_error:
         if not coverage["central_findings"]:
             missing.append("central_claims_not_adequately_attributed_in_principal_sections")
+        if coverage["objective"] and coverage["central_findings"] and not coverage["objective_result_linked"]:
+            missing.append("no_lexical_link_between_objective_and_selected_central_results")
         results_pages = {p.page for p in eligible_passages if p.section == "results"
                          and (p.kind == "table" or len(p.text.split()) >= 10)}
         represented_pages = {e.page for e in records if e.origin != "background"}
@@ -193,14 +272,17 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
     substantive = coverage["central_findings"] and any(
         e.category in RESULT_CATEGORIES and
         (e.origin == "current_study" or document_type == "review") for e in selected)
-    adequate_attribution = substantive and (coverage["objective"] or len(central_records) >= 2)
+    # One isolated result cannot establish adequacy. Multiple central records
+    # can remain useful as partial quality when the objective is absent or unclear.
+    adequate_attribution = substantive and (coverage["objective_result_linked"]
+                                             or len(central_records) >= 2)
     if processing_error:
         status = "failed"
         reasons = ["Processing failed before a validated report could be completed"]
     elif not adequate_attribution:
         status = "failed"
         reasons.append("Required attributable central evidence was not established")
-    elif missing or source_issues or document_type == "unknown":
+    elif missing or source_issues or document_type == "unknown" or not coverage["objective_result_linked"]:
         status = "partial"
     else:
         status = "completed"
@@ -243,6 +325,7 @@ def build_synthesis_payload(selected, passages, metadata, *, max_items=9, max_ch
             "evidence_id": record.id, "passage_id": record.passage_id, "page": record.page,
             "section": record.section, "category": record.category, "origin": record.origin,
             "attribution": record.attribution, "importance": record.importance, "value": record.value,
+            "measure": record.measure.model_dump() if getattr(record, "measure", None) else None,
             "source_text": focused_source,
             "source_context": (record.context_text[:700]
                                if record.context_text and record.context_text != focused_source else ""),
@@ -279,8 +362,9 @@ def validate_narrative_issues(narrative, payload):
     section_categories = {
         "introduction": {"objective", "study_design", "finding", "conclusion"},
         "methods_scope": {"study_design", "population", "sample_size", "denominator"},
-        "key_findings": {"finding", *NUMERIC_CATEGORIES, "conclusion"},
-        "statistical_information": NUMERIC_CATEGORIES,
+        "key_findings": {"finding", *NUMERIC_CATEGORIES, "conclusion", "study_design",
+                         "population", "sample_size", "denominator"},
+        "statistical_information": NUMERIC_CATEGORIES | {"statistical_warning"},
         "conclusion": {"finding", "conclusion", "limitation", *NUMERIC_CATEGORIES},
     }
     for section in ("introduction", "methods_scope", "key_findings",
@@ -314,13 +398,50 @@ def validate_narrative_issues(narrative, payload):
                     f"Narrative uses an incompatible evidence category in {section}",
                     section, claim, {"evidence_id": evidence_id,
                                      "category": evidence[evidence_id]["category"]})
+            if section == "key_findings":
+                categories = {evidence[item_id]["category"] for item_id in claim.evidence_ids}
+                substantive = {"finding", *NUMERIC_CATEGORIES, "conclusion"}
+                if not categories & substantive:
+                    add("context_does_not_authorize_finding",
+                        "Methods, population, and denominator context cannot stand alone as a finding",
+                        section, claim)
             cited_record = evidence[evidence_id]
+            claim_groups = _group_terms(claim.text)
+            if claim_groups and cited_record["category"] in NUMERIC_CATEGORIES:
+                measure = cited_record.get("measure") or {}
+                source_groups = _group_terms(measure.get("subgroup") or "")
+                if not source_groups or not claim_groups <= source_groups:
+                    add("unsupported_subgroup_binding",
+                        "A subgroup claim must match an explicit source-linked measure subgroup",
+                        section, claim, {"claim_groups": sorted(claim_groups),
+                                         "measure_subgroup": measure.get("subgroup")})
             claim_categories = {evidence[item_id]["category"] for item_id in claim.evidence_ids}
             if ("p_value" in claim_categories and not claim_categories & {"finding", "effect_size"}
                     and re.search(r"\b(?:caus(?:e|es|ed|al)|strong(?:er)?|weak(?:er)?|large|small)\b",
                                   claim.text, re.I)):
                 add("p_value_overinterpretation",
                     "A p-value alone cannot support a causal or association-strength claim",
+                    section, claim)
+            study_designs = [evidence[item_id] for item_id in claim.evidence_ids
+                             if evidence[item_id]["category"] == "study_design"]
+            causal_language = re.search(r"\bcaus(?:e|es|ed|al)\b", claim.text, re.I)
+            observational = any(re.search(
+                r"\b(?:observational|cross[- ]?sectional|cohort|case[- ]control|survey|"
+                r"retrospective|prospective)\b",
+                item.get("value", "") + " " + item.get("source_text", ""), re.I)
+                for item in study_designs)
+            cited_source_text = " ".join(evidence[item_id].get("source_text", "") + " " +
+                                          evidence[item_id].get("value", "")
+                                          for item_id in claim.evidence_ids)
+            source_states_causality = bool(re.search(r"\bcaus(?:e|es|ed|al)\b",
+                                                      cited_source_text, re.I))
+            attributes_to_authors = bool(re.search(
+                r"\b(?:authors?|paper|study)\s+(?:reported|stated|claimed|concluded|argued)\b",
+                claim.text, re.I))
+            if causal_language and (observational or not source_states_causality
+                                    or not attributes_to_authors):
+                add("unsupported_causal_claim",
+                    "Causal wording needs explicit source attribution and cannot be inferred from observational evidence",
                     section, claim)
             if not set(claim.source_ids) & set(evidence[evidence_id]["source_ids"]):
                 add("unlinked_citation", f"Narrative citation does not link to evidence {evidence_id}",
@@ -370,14 +491,38 @@ def _cite_claim(claim, evidence_by_id, passages_by_id):
     return " [" + "; ".join(dict.fromkeys(refs)) + "]"
 
 
-def _numeric_context(record, width=90):
-    """Show only nearby source wording while keeping the exact measure visible."""
+def _numeric_context(record, selected, width=90):
+    """Show context while suppressing source numbers not represented by typed facts."""
     if record.context_text:
-        return record.context_text
-    start = max(0, record.value_start - width)
-    end = min(len(record.quote), record.value_end + width)
-    excerpt = record.quote[start:end].strip()
-    return ("…" if start else "") + excerpt + ("…" if end < len(record.quote) else "")
+        excerpt = record.context_text
+    else:
+        start = max(0, record.value_start - width)
+        end = min(len(record.quote), record.value_end + width)
+        excerpt = record.quote[start:end].strip()
+        excerpt = ("…" if start else "") + excerpt + ("…" if end < len(record.quote) else "")
+    related_ids = set(getattr(record, "context_ids", []) or [])
+    authorized = {match.group().casefold() for match in NUMBER_TOKEN.finditer(record.value)}
+    if getattr(record, "measure", None):
+        authorized.update(match.group().casefold() for match in NUMBER_TOKEN.finditer(
+            record.measure.exact_text))
+    for item in selected:
+        explicit_context_link = (item.passage_id in related_ids or
+                                 record.passage_id in (getattr(item, "context_ids", []) or []))
+        same_table_row = (record.source_kind == item.source_kind == "table"
+                          and record.passage_id == item.passage_id)
+        if explicit_context_link or same_table_row:
+            authorized.update(match.group().casefold() for match in NUMBER_TOKEN.finditer(item.value))
+            if getattr(item, "measure", None):
+                measure = item.measure
+                authorized.update(match.group().casefold() for match in NUMBER_TOKEN.finditer(measure.exact_text))
+        measure = getattr(record, "measure", None)
+        if (measure and measure.relation_status == "explicit"
+                and record.passage_id in measure.relation_source_ids):
+            for related_value in (measure.denominator, measure.subgroup):
+                authorized.update(match.group().casefold() for match in NUMBER_TOKEN.finditer(
+                    related_value or ""))
+    return NUMBER_TOKEN.sub(lambda match: match.group() if match.group().casefold() in authorized
+                            else "[unvalidated value omitted]", excerpt)
 
 
 def render_report(source, selected, passages, metadata, outcome, narrative=None):
@@ -423,7 +568,7 @@ def render_report(source, selected, passages, metadata, outcome, narrative=None)
                 attribution = (f"Cited study ({escape(evidence.attribution or 'attribution unclear')}) reported"
                                if evidence.origin == "cited_study" else "The paper reported")
                 lines += [f"- **{attribution} {label}:** {escape(evidence.value)} — "
-                          f"{escape(_numeric_context(evidence))} "
+                          f"{escape(_numeric_context(evidence, selected))} "
                           f"[{evidence.id}; {evidence.passage_id}; PDF p. {evidence.page}]", ""]
     if outcome.missing_coverage or outcome.status != "completed":
         lines += ["## Quality note", "",
@@ -439,7 +584,7 @@ def render_limited_overview(source, overview, source_locations, outcome, reason)
     if outcome.processing_status == "failed":
         heading = "Processing failed — limited overview only"
     elif outcome.status == "failed":
-        heading = "Research readiness failed — limited overview only"
+        heading = "Research report unavailable — limited overview only"
     else:
         heading = f"Limited overview only — research quality {outcome.status}"
     lines = [f"# {heading}", "", f"Source: {escape(source)}", ""]

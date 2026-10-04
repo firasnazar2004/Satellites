@@ -140,7 +140,7 @@ limit. With no accepted rows, statistics are skipped.
 python -m app research path/to/paper.pdf
 ```
 
-Research schema v2.2 uses pdfplumber word geometry, conservative spacing/line-break
+Research schema v2.3 uses pdfplumber word geometry, conservative spacing/line-break
 normalization, section recognition, and ruled-table extraction. Raw text, cells,
 coordinates, normalized text, and application-assigned passage IDs remain auditable.
 Continuation pages in front-matter lists stay excluded; identifiable second-row
@@ -153,15 +153,18 @@ from findings; cited studies are distinguished from the document's own work.
 Before readiness is assessed, a bounded targeted pass recovers missing objectives,
 methods, populations, conclusions, and caveats from high-relevance passages.
 Short method labels, child population/eligibility blocks, table rows, and table
-footnotes retain explicit context links. Explicit statistic/p-value pairs in an
-already accepted table row are kept as separate validated measure types.
+footnotes retain explicit context links. Explicit statistics, degrees of freedom,
+p-values, and statistical warnings are kept as separately validated, linked types.
+When a passage explicitly links a total source pool to an eligible subset, both
+counts retain that source-stated relationship and its provenance.
 Supported document classification is retained even when optional bibliographic
 fields are rejected. Numeric values must appear in the raw local passage, and
 table measures remain provisional until their original headings are reviewed.
 
 Global ranking and deduplication reserve the objective, method, population,
-sample/denominator, central result, inferential pair, conclusion, and caveat for a bounded Qwen
-synthesis. Python checks evidence and passage IDs in every narrative claim and
+sample/denominator, central result, inferential pair, conclusion, and caveat for bounded Qwen
+synthesis. Invalid sections receive localized repair while accepted claims survive.
+Python checks evidence and passage IDs in every narrative claim and
 renders all numbers from their validated source records, including source wording,
 units and page citations. The Markdown report has introduction, methods, findings,
 statistical information and conclusion sections. Empirical, review, and theoretical
@@ -190,13 +193,21 @@ Artifacts: `pages.json`, `passages.json`, `evidence.json`,
 Existing checkpoints are downloadable even for failed jobs. Legacy job artifacts
 are not migrated; their API `research` field is null.
 
+The research model is configurable locally with `LOCAL_AI_RESEARCH_MODEL`
+(default `qwen3.5:4b`). `/health` reports that model separately from the other
+pipelines' Qwen model without loading either one. Quality artifacts expose report
+availability/kind and stage outcomes beside the generic job status. Synthesis
+validation exhaustion is a research-quality failure; transport/schema exceptions
+remain processing failures. Failed jobs retain the extraction-complete state saved
+by the research pipeline.
+
 OCR remains excluded. Unruled or complex tables, ambiguous headings/layouts and
 semantic attribution need human review. Model citations are checked against
 supplied validated IDs; exact mention does not prove semantic support. See
-[research contracts, limitations and verification](docs/RESEARCH_PIPELINE.md).
-The research regression suite and read-only saved-artifact replay pass. The replay
-does not call Ollama or process the PDF again; re-run the API pipeline with local
-Ollama available to evaluate the final generated prose.
+[research core implementation and verification](RESEARCH_CORE_IMPLEMENTATION.md).
+The offline research regression suite and read-only saved-artifact replay use the
+production selection, validation, rendering, and status adapters. They do not call
+Ollama or process the PDF again; live model and paper quality still need your review.
 
 ## Flashcards
 

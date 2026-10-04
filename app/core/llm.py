@@ -1,6 +1,7 @@
 """Small Ollama adapter for schema-constrained local LLM responses."""
 
 import time
+import os
 from typing import TypeVar
 
 import ollama
@@ -9,7 +10,7 @@ from pydantic import BaseModel
 StructuredResponse = TypeVar("StructuredResponse", bound=BaseModel)
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3:8b"
-RESEARCH_MODEL = "qwen3.5:4b"
+RESEARCH_MODEL = os.environ.get("LOCAL_AI_RESEARCH_MODEL", "qwen3.5:4b")
 
 
 def generate_structured(
