@@ -9,6 +9,7 @@ from pydantic import BaseModel
 StructuredResponse = TypeVar("StructuredResponse", bound=BaseModel)
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3:8b"
+RESEARCH_MODEL = "qwen3.5:4b"
 
 
 def generate_structured(
@@ -17,6 +18,7 @@ def generate_structured(
     *,
     model: str = DEFAULT_MODEL,
     system_prompt: str | None = None,
+    keep_alive: str | int = "2m",
 ) -> StructuredResponse:
     """Generate a response with Ollama and validate it as a Pydantic model."""
 
@@ -34,10 +36,15 @@ def generate_structured(
                 format=response_model.model_json_schema(),
                 options={"temperature": 0, "num_ctx": 4096, "num_predict": 1800},
                 think=False,
-                keep_alive="2m",
+                keep_alive=keep_alive,
             )
             break
         except ollama.ResponseError as exc:
+            if model == RESEARCH_MODEL and exc.status_code == 404:
+                raise RuntimeError(
+                    f"{RESEARCH_MODEL} is required for the research pipeline but is "
+                    f"unavailable in Ollama; run `ollama pull {RESEARCH_MODEL}`"
+                ) from exc
             if exc.status_code not in {500, 502, 503} or attempt == 2:
                 raise
             time.sleep(2**attempt)

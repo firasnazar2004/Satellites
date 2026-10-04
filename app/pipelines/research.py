@@ -7,7 +7,7 @@ import re
 from importlib.metadata import version
 from pathlib import Path
 
-from app.core.llm import DEFAULT_MODEL, generate_structured
+from app.core.llm import RESEARCH_MODEL, generate_structured
 from app.models.research import (
     DocumentProfile, ExtractionBatch, LimitedOverview, ResearchNarrative, SourcePassage,
 )
@@ -18,7 +18,8 @@ from app.pipelines.research_reporting import (
     render_report, select_evidence, validate_narrative,
 )
 
-MODEL = DEFAULT_MODEL
+MODEL = RESEARCH_MODEL
+KEEP_ALIVE = -1
 MAX_ATTEMPTS = 3
 MAX_SYNTHESIS_ATTEMPTS = 2
 SYSTEM = (
@@ -169,7 +170,13 @@ def profile_document(passages, document_type, event):
     best_metadata = []
     for attempt in range(MAX_ATTEMPTS):
         try:
-            profile = generate_structured(prompt, DocumentProfile, model=MODEL, system_prompt=SYSTEM)
+            profile = generate_structured(
+                prompt,
+                DocumentProfile,
+                model=MODEL,
+                system_prompt=SYSTEM,
+                keep_alive=KEEP_ALIVE,
+            )
             problems = []
             type_supported = (profile.document_type == "unknown" or
                 bool(profile.type_source_ids) and set(profile.type_source_ids) <= allowed.keys())
@@ -285,7 +292,8 @@ def generate_limited_overview(passages, pages, event):
     for attempt in range(2):
         try:
             result = generate_structured(prompt, LimitedOverview, model=MODEL,
-                                         system_prompt=OVERVIEW_SYSTEM)
+                                         system_prompt=OVERVIEW_SYSTEM,
+                                         keep_alive=KEEP_ALIVE)
             sentence_count = len(re.findall(r"[.!?](?:\s|$)", result.overview.strip()))
             if not sentence_count:
                 sentence_count = 1
@@ -323,7 +331,8 @@ def generate_research_narrative(selected, passages, metadata, event):
     for attempt in range(MAX_SYNTHESIS_ATTEMPTS):
         try:
             narrative = generate_structured(prompt, ResearchNarrative, model=MODEL,
-                                            system_prompt=SYNTHESIS_SYSTEM)
+                                            system_prompt=SYNTHESIS_SYSTEM,
+                                            keep_alive=KEEP_ALIVE)
             validation = validate_narrative(narrative, payload)
             event({"stage": "synthesis", "attempt": attempt + 1, "validation_errors": validation,
                    "claims": sum(len(getattr(narrative, name) or []) if name != "introduction"
@@ -448,7 +457,8 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
                     errors = []
                     try:
                         result = generate_structured(prompt, ExtractionBatch, model=MODEL,
-                                                    system_prompt=SYSTEM)
+                                                    system_prompt=SYSTEM,
+                                                    keep_alive=KEEP_ALIVE)
                         last_exception = None
                         for proposal in result.evidence:
                             if proposal.passage_id not in allowed:
