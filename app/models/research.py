@@ -70,12 +70,17 @@ class GroundedEvidence(EvidenceProposal):
     value_start: int
     value_end: int
     context_ids: list[str] = Field(default_factory=list)
+    context_text: str = Field(default="", max_length=1200)
+    extraction_method: Literal[
+        "model", "targeted_model", "deterministic_recovery",
+        "deterministic_numeric_recovery",
+    ] = "model"
     warnings: list[str] = Field(default_factory=list)
 
 
 class ResearchOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    schema_version: str = "2.1"
+    schema_version: str = "2.2"
     status: Literal["completed", "partial", "failed"]
     processing_status: Literal["completed", "failed"] = "completed"
     processing_error: str | None = None

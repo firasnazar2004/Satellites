@@ -15,7 +15,7 @@ MEASURES = {
     "percentage": rf"{NUMBER}\s*(?:%|percent\b|per cent\b)",
     "p_value": rf"\b[pP](?:[- ]values?)?\s*(?:=|<=|>=|<|>|≤|≥|was|is|of)\s*{NUMBER}",
     "confidence_interval": rf"(?:\b(?:\d+(?:\.\d+)?\s*%\s*)?(?:confidence interval|CI)\b\s*(?:[:=]|was|is|of)?\s*[\[(]?\s*{NUMBER}\s*(?:,|;|to|[-–—])\s*{NUMBER})",
-    "test_statistic": rf"(?:\b(?:chi[- ]?square(?:d)?|χ[²2]?|chi2|[tFz])\b\s*(?:\([^)]{{1,35}}\))?\s*[:=]\s*{NUMBER})",
+    "test_statistic": rf"(?:\b(?:chi[- ]?square(?:d)?|Pearson\s+Chi[- ]?Square|Likelihood\s+Ratio|χ[²2]?|chi2|[tFz])\b(?:\s*\([^)]{{1,35}}\))?(?:\s*\|\s*Value)?\s*[:=]\s*{NUMBER})",
     "effect_size": rf"(?:Cohen[’']?s?\s*d|Hedges[’']?\s*g|odds ratio|risk ratio|hazard ratio|mean difference|Cram[eé]r[’']?s?\s*V|eta[- ]squared|epsilon[- ]squared|rank[- ]biserial|R[²2]|\br\b|\brho\b|\bOR\b|\bRR\b|\bHR\b)\s*(?:was|is|of|=|:)\s*{NUMBER}",
     "diagnostic_accuracy": rf"(?:(?:sensitivity|specificity|accuracy|AUC|positive predictive value|negative predictive value)\s*(?:was|is|of|=|:)?\s*{NUMBER}\s*%?|{NUMBER}\s*%\s*(?:sensitivity|specificity|accuracy))",
 }
@@ -41,6 +41,20 @@ def numerical_tokens(text):
     return re.findall(NUMBER, text)
 
 
+def _context_window(text, start, end, width=180):
+    """Retain the exact sentence/window that gives a measure its subgroup meaning."""
+    if len(text) <= width * 2:
+        return text.strip()
+    left = max(text.rfind(". ", 0, start), text.rfind("; ", 0, start))
+    left = 0 if left < 0 else left + 2
+    right_candidates = [position for marker in (". ", "; ")
+                        if (position := text.find(marker, end)) >= 0]
+    right = min(right_candidates) + 1 if right_candidates else len(text)
+    if right - left > width * 2:
+        left, right = max(0, start - width), min(len(text), end + width)
+    return text[left:right].strip()
+
+
 def validate_proposal(item, passage, *, source, evidence_id, document_type):
     reasons = []
     text, category = passage.text, item.category
@@ -56,7 +70,8 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
         count = len(text.split())
         concise_design = (category == "study_design" and bool(re.search(
             r"\b(?:cross[- ]?sectional|cohort|case[- ]control|randomi[sz]ed|"
-            r"systematic review|meta[- ]analysis|clinical trial)\b", text, re.I)))
+            r"systematic review|meta[- ]analysis|clinical trial|convenience sampling|"
+            r"probability sampling|purposive sampling)\b", text, re.I)))
         if not concise_design and (count < 4 or text.rstrip().endswith(":") or
                 (count < 6 and not re.search(r"[.!?][\])\"']?$", text.rstrip()))):
             reasons.append("incomplete_fragment")
@@ -71,10 +86,11 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
             pattern += rf"|\b(?:Valid Percent|Cumulative Percent|Percent(?:age)?)\s*:\s*{NUMBER}"
         if passage.kind == "table" and category == "sample_size":
             pattern += rf"|\bN of Valid Cases\s*\|\s*(?:Value\s*:\s*)?{NUMBER}"
+            pattern += rf"|\bTotal\s*\|(?:[^|]+\|){{0,2}}\s*Frequency\s*:\s*{NUMBER}"
         if passage.kind == "table" and category == "p_value":
             pattern += rf"|(?:Asymp\.\s*Sig\.|Exact\s*Sig\.)(?:\s*\([^)]*\))?\s*:\s*{NUMBER}"
         if passage.kind == "table" and category == "test_statistic":
-            pattern += rf"|\b(?:Pearson\s+)?Chi[- ]?Square\s*\|\s*(?:Value\s*:\s*)?{NUMBER}[a-z]?"
+            pattern += rf"|\b(?:Pearson\s+Chi[- ]?Square|Likelihood\s+Ratio)\s*\|\s*(?:Value\s*:\s*)?{NUMBER}[a-z]?"
         matches = list(re.finditer(pattern, text, re.I))
         # The value must touch the labelled measure; an unrelated number elsewhere
         # in the paragraph cannot borrow a label or a significance symbol.
@@ -84,6 +100,12 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
                              and item_numbers & set(numerical_tokens(m.group()))]
         supported_numbers = {number for m in supported_matches for number in numerical_tokens(m.group())
                              if number in item_numbers}
+        # Parenthetical labels such as ``(2-sided)`` are not additional
+        # p-values. The validated p-value is the final numeric token in the
+        # explicitly labelled measure.
+        if category == "p_value":
+            supported_numbers = {tokens[-1] for match in supported_matches
+                                 if (tokens := numerical_tokens(match.group()))}
         if not supported_matches:
             reasons.append("missing_local_measure_label_or_supported_measure_shape")
         elif len(supported_numbers) > 1 and category not in {"confidence_interval", "test_statistic"}:
@@ -99,6 +121,13 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
                         reasons.append("p_value_outside_unit_interval")
                 except ValueError:
                     reasons.append("unsupported_p_value_notation")
+        if category == "percentage" and span:
+            local = text[max(0, span[0]-80):min(len(text), span[1]+80)]
+            if re.search(r"\b(?:sensitivity|specificity|accuracy|AUC|"
+                         r"positive predictive value|negative predictive value)\b", local, re.I):
+                reasons.append("percentage_is_a_more_specific_diagnostic_measure")
+        if span and passage.kind == "text" and text.count(item.value) > 1:
+            reasons.append("ambiguous_repeated_value_requires_context")
     checks = {
         "objective": r"\b(?:aim|objective|purpose|question|investigat|examin|propos|study whether|determin|assess|evaluat|estimat|identif|quantif|explor)",
         "study_design": r"\b(?:cross[- ]?sectional|cohort|case[- ]control|randomi[sz]|trial|retrospective|prospective|survey|sampling|systematic review|meta[- ]analysis|proof|theorem|framework|experiment|method)",
@@ -134,12 +163,14 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
         reasons.append("attribution_only_for_cited_studies")
     if reasons:
         return None, sorted(set(reasons))
-    if category in NUMERIC_CATEGORIES and supported_matches and len(item.value) > 90:
-        # Keep accepted measures bounded to the exact supported span; the full
-        # passage remains in quote for subgroup and denominator review.
+    if category in NUMERIC_CATEGORIES and supported_matches:
+        # Store the shortest exact labelled measure for the requested type.
+        # Subgroup, denominator and comparison wording remains in context_text.
         measure = min(supported_matches, key=lambda match: len(match.group()))
-        item = item.model_copy(update={"value": measure.group()})
-        span = measure.span()
+        unrelated = set(numerical_tokens(item.value)) - set(numerical_tokens(measure.group()))
+        if len(item.value) > 90 or unrelated:
+            item = item.model_copy(update={"value": measure.group()})
+            span = measure.span()
     warnings = list(passage.warnings)
     if passage.kind == "table":
         warnings.append("Table measures use explicit labels; header association and footnotes require review")
@@ -148,6 +179,7 @@ def validate_proposal(item, passage, *, source, evidence_id, document_type):
     return GroundedEvidence(**item.model_dump(), id=evidence_id, source=source,
         page=passage.page, section=passage.section, source_kind=passage.kind, quote=text,
         value_start=span[0], value_end=span[1], context_ids=passage.context_ids,
+        context_text=_context_window(text, span[0], span[1]),
         warnings=warnings), []
 
 
@@ -155,8 +187,8 @@ def duplicate_of(record, records):
     """Keep differing subgroup/context passages even if scalar values coincide."""
     return next((old for old in records if old.category == record.category
             and old.origin == record.origin and old.attribution == record.attribution
-            and old.value == record.value and (old.quote == record.quote or
-                (old.page == record.page and (old.quote in record.quote or record.quote in old.quote)))), None)
+            and old.value == record.value and old.context_text == record.context_text
+            and old.passage_id == record.passage_id), None)
 
 
 def deduplicate(records):

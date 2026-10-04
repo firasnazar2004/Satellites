@@ -64,6 +64,62 @@ def table_headers(rows):
     return headers, title, 2 if second_is_header else 1
 
 
+def link_table_context(passages):
+    """Attach table footnotes to result rows, and result rows back to footnotes."""
+    footnote_ids = [item["id"] for item in passages if re.search(
+        r"(?:^[a-z]\.|footnote|expected count|minimum expected|missing)", item["text"], re.I)]
+    result_ids = [item["id"] for item in passages if item["id"] not in footnote_ids]
+    for item in passages:
+        related = footnote_ids if item["id"] not in footnote_ids else result_ids
+        item["context_ids"] = list(dict.fromkeys(item.get("context_ids", []) + related))
+    return passages
+
+
+def link_text_context(passages):
+    """Link short method labels and their children without merging source text.
+
+    PDF layouts often place ``3.3 Study population`` and the population itself
+    in separate blocks. The IDs remain independently auditable, while these
+    links preserve the hierarchy for extraction and report synthesis.
+    """
+    numbered = re.compile(r"^\s*\d+(?:\.\d+)+\s+\S")
+    minor = re.compile(
+        r"\b(?:inclusion|exclusion)\s+criteria|sampling(?:\s+technique)?|"
+        r"study\s+(?:type|design|area|setting|population)|data[- ]collection|"
+        r"data\s+analysis|ethical\s+considerations\b", re.I)
+
+    def heading_level(text):
+        if numbered.search(text):
+            return 1
+        if len(text.split()) <= 10 and (text.rstrip().endswith(":")
+                or minor.search(text)):
+            return 2
+        return None
+
+    parent = local = None
+    for item in passages:
+        level = heading_level(item["text"])
+        if level == 1:
+            parent, local = item, None
+            continue
+        if level == 2:
+            if parent:
+                item["context_ids"] = list(dict.fromkeys(
+                    item.get("context_ids", []) + [parent["id"]]))
+                parent["context_ids"] = list(dict.fromkeys(
+                    parent.get("context_ids", []) + [item["id"]]))
+            local = item
+            continue
+        context = [candidate for candidate in (parent, local)
+                   if candidate and candidate["section"] == item["section"]]
+        for heading in context:
+            item["context_ids"] = list(dict.fromkeys(
+                item.get("context_ids", []) + [heading["id"]]))
+            heading["context_ids"] = list(dict.fromkeys(
+                heading.get("context_ids", []) + [item["id"]]))
+    return passages
+
+
 def numeric_inventory(text):
     # Compare extraction views without attempting to repair numerical strings.
     return Counter(re.findall(r"[+−-]?(?:\d+(?:[.,]\d+)*|\.\d+)(?:[eE][+−-]?\d+)?", text))
@@ -268,6 +324,7 @@ def extract_pages(path, *, passage_chars=900, reading_order="auto"):
                 p["context_ids"] = [q["id"] for q in text_passages
                                     if q["block_index"] == p["block_index"]
                                     and q["id"] != p["id"]]
+            link_text_context(text_passages)
             for table in table_records:
                 near_block_indexes = {
                     index for index, block in enumerate(blocks, 1)
@@ -284,6 +341,7 @@ def extract_pages(path, *, passage_chars=900, reading_order="auto"):
                 # Header association is explicit, provisional, and auditable.
                 headers, title, header_rows = table_headers(table["rows"])
                 table["header_rows"] = header_rows
+                table_passages = []
                 for ri, row in enumerate(table["rows"][1:], 1):
                     if ri < header_rows:
                         continue
@@ -296,12 +354,16 @@ def extract_pages(path, *, passage_chars=900, reading_order="auto"):
                     if len(text) > passage_chars:
                         warnings.append(f"{table['id']} row {ri} exceeds passage budget; retained only in tables")
                         continue
-                    passages.append(SourcePassage(id=f"P{number}-{table['id']}-R{ri}",
+                    table_passages.append(SourcePassage(id=f"P{number}-{table['id']}-R{ri}",
                         page=number, section=table_section, kind="table", text=text,
                         raw_text=raw, bbox=table["bbox"], table_id=table["id"],
                         context_ids=table["context_ids"],
                         warnings=["Table header association needs review; see raw cells and context"]+
                                  [w for w in warnings if w.startswith("Numeric token")]).model_dump(mode="json"))
+                # Statistical footnotes qualify every row in their table. Link
+                # them explicitly so selection and synthesis cannot separate a
+                # result from an expected-count or similar interpretation caveat.
+                passages.extend(link_table_context(table_passages))
             normalized_page = "\n\n".join([b["text"] for b in blocks] +
                 ["\n".join(" | ".join(normalize_text(c or "") for c in row)
                            for row in t["rows"]) for t in table_records])

@@ -140,7 +140,7 @@ limit. With no accepted rows, statistics are skipped.
 python -m app research path/to/paper.pdf
 ```
 
-Research schema v2.1 uses pdfplumber word geometry, conservative spacing/line-break
+Research schema v2.2 uses pdfplumber word geometry, conservative spacing/line-break
 normalization, section recognition, and ruled-table extraction. Raw text, cells,
 coordinates, normalized text, and application-assigned passage IDs remain auditable.
 Continuation pages in front-matter lists stay excluded; identifiable second-row
@@ -150,11 +150,17 @@ Qwen selects passage IDs and short literal values; Python retrieves the quotatio
 and checks measure labels, category shapes, attribution, and exact numeric support.
 Corrective extraction attempts are bounded. References/front matter are excluded
 from findings; cited studies are distinguished from the document's own work.
+Before readiness is assessed, a bounded targeted pass recovers missing objectives,
+methods, populations, conclusions, and caveats from high-relevance passages.
+Short method labels, child population/eligibility blocks, table rows, and table
+footnotes retain explicit context links. Explicit statistic/p-value pairs in an
+already accepted table row are kept as separate validated measure types.
 Supported document classification is retained even when optional bibliographic
 fields are rejected. Numeric values must appear in the raw local passage, and
 table measures remain provisional until their original headings are reviewed.
 
-Global ranking and deduplication select validated evidence for a bounded Qwen
+Global ranking and deduplication reserve the objective, method, population,
+sample/denominator, central result, inferential pair, conclusion, and caveat for a bounded Qwen
 synthesis. Python checks evidence and passage IDs in every narrative claim and
 renders all numbers from their validated source records, including source wording,
 units and page citations. The Markdown report has introduction, methods, findings,
@@ -188,9 +194,9 @@ OCR remains excluded. Unruled or complex tables, ambiguous headings/layouts and
 semantic attribution need human review. Model citations are checked against
 supplied validated IDs; exact mention does not prove semantic support. See
 [research contracts, limitations and verification](docs/RESEARCH_PIPELINE.md).
-The research regression suite and read-only dissertation extraction checks pass.
-A live Qwen profiling attempt could not connect to local Ollama in this session;
-re-run the API pipeline with Ollama available to evaluate the final report.
+The research regression suite and read-only saved-artifact replay pass. The replay
+does not call Ollama or process the PDF again; re-run the API pipeline with local
+Ollama available to evaluate the final generated prose.
 
 ## Flashcards
 

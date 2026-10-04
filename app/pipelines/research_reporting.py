@@ -14,35 +14,70 @@ NUMERIC_CATEGORIES = {
     "sample_size", "denominator", "percentage", "test_statistic", "p_value",
     "confidence_interval", "effect_size", "diagnostic_accuracy",
 }
-NUMBER_TOKEN = re.compile(r"(?<![A-Za-z0-9])(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?(?!\d)")
+RESULT_CATEGORIES = {
+    "finding", "percentage", "test_statistic", "p_value", "confidence_interval",
+    "effect_size", "diagnostic_accuracy",
+}
+NUMBER_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9.])[+−-]?(?:\d[\d,]*(?:\.\d+)?|\.\d+)%?(?![A-Za-z0-9%])"
+)
+NUMBER_WORD = re.compile(
+    r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+    r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million)\b",
+    re.I,
+)
+CONTENT_WORD = re.compile(r"[A-Za-z][A-Za-z-]{2,}")
+STOP_WORDS = {"the", "and", "for", "that", "this", "with", "from", "were", "was",
+              "study", "paper", "result", "results", "found", "reported", "within"}
 
 
 def _unsupported_figures(claim, evidence):
-    """Figures in prose must occur literally in a numeric record cited by this claim."""
+    """Return figures/number words not literally supported by cited numeric records."""
+    cited_values = [evidence[evidence_id]["value"] for evidence_id in claim.evidence_ids
+                    if evidence_id in evidence
+                    and evidence[evidence_id]["category"] in NUMERIC_CATEGORIES]
     allowed = {
-        match.group() for evidence_id in claim.evidence_ids
-        if evidence_id in evidence and evidence[evidence_id]["category"] in NUMERIC_CATEGORIES
-        for match in NUMBER_TOKEN.finditer(evidence[evidence_id]["value"])
+        match.group().casefold() for value in cited_values for match in NUMBER_TOKEN.finditer(value)
     }
-    return {match.group() for match in NUMBER_TOKEN.finditer(claim.text)} - allowed
+    unsupported = {match.group() for match in NUMBER_TOKEN.finditer(claim.text)
+                   if match.group().casefold() not in allowed}
+    supported_text = " ".join(cited_values).casefold()
+    unsupported.update(match.group() for match in NUMBER_WORD.finditer(claim.text)
+                       if match.group().casefold() not in supported_text)
+    return unsupported
+
+
+def _terms(text):
+    return {word.casefold() for word in CONTENT_WORD.findall(text)
+            if word.casefold() not in STOP_WORDS}
 
 
 def select_evidence(records, document_type, limit=9):
-    """Reserve bounded report space for aim, method, main results and caveats."""
+    """Reserve space for the question, design, central results, context and caveats."""
     candidates = [e for e in records if e.origin == "current_study" or
                   (document_type == "review" and e.origin == "cited_study")]
     section_score = {"abstract": 9, "results": 8, "conclusions": 6, "limitations": 7,
                      "methods": 5, "discussion": 4, "introduction": 3, "front_matter": 0}
 
+    objective_terms = set().union(*(_terms(e.value + " " + e.quote) for e in candidates
+                                    if e.category == "objective"))
+
     def rank(e):
-        return (section_score.get(e.section, 1) + (2 if e.importance == "primary" else 0),
-                e.origin == "current_study", e.source_kind == "text", -len(e.quote), -e.page)
+        value_text = e.value.casefold()
+        overlap = len(objective_terms & _terms(e.context_text or e.quote))
+        central = 5 if re.search(
+            r"\b(?:primary|main|overall|prevalence|incidence|principal|most common|found to be)\b",
+            value_text, re.I) else 0
+        return (section_score.get(e.section, 1) + (2 if e.importance == "primary" else 0)
+                + central + min(overlap, 4), e.origin == "current_study",
+                bool(e.context_text), e.source_kind == "text", -e.page, -len(e.quote))
 
     ranked = sorted(candidates, key=rank, reverse=True)
     selected, used, per_page, per_passage = [], set(), Counter(), Counter()
 
     def add(record):
-        key = (record.origin, record.attribution, record.category, record.value)
+        key = (record.passage_id, record.category, record.value, record.context_text)
         if key in used or len(selected) >= limit or per_passage[record.passage_id] >= 2:
             return
         used.add(key)
@@ -50,10 +85,9 @@ def select_evidence(records, document_type, limit=9):
         per_page[record.page] += 1
         per_passage[record.passage_id] += 1
 
-    for categories in (("objective",), ("study_design",),
-                       ("sample_size", "denominator", "population"),
-                       ("finding", "percentage", "effect_size", "test_statistic",
-                        "p_value", "confidence_interval", "diagnostic_accuracy"),
+    for categories in (("objective",), ("study_design",), ("population",),
+                       ("sample_size", "denominator"),
+                       tuple(RESULT_CATEGORIES),
                        ("test_statistic", "effect_size", "confidence_interval"),
                        ("p_value",),
                        ("conclusion",), ("limitation",)):
@@ -70,19 +104,22 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
                     problems, rejected_attempts, eligible_passages, pages,
                     processing_error=None):
     own = [e for e in records if e.origin == "current_study"]
+    reportable = own if document_type != "review" else [
+        e for e in records if e.origin in {"current_study", "cited_study"}
+    ]
     coverage = {
         "objective": any(e.category == "objective" for e in own),
         "methods": any(e.category == "study_design" for e in own),
         "population": any(e.category in {"population", "sample_size", "denominator"} for e in own),
-        "findings": any(e.category in {"finding", *NUMERIC_CATEGORIES} for e in own),
+        "findings": any(e.category in RESULT_CATEGORIES for e in reportable),
         "conclusions": any(e.category == "conclusion" for e in own),
         "limitations": any(e.category == "limitation" for e in own),
         "cited_findings": any(e.origin == "cited_study" for e in records),
         "central_findings": any(
-            e.origin == "current_study"
+            (e.origin == "current_study" or document_type == "review")
             and e.section in {"abstract", "results", "discussion", "conclusions"}
-            and e.category in {"finding", *NUMERIC_CATEGORIES, "conclusion"}
-            for e in records
+            and e.category in RESULT_CATEGORIES
+            for e in reportable
         ),
     }
     applicable = {
@@ -114,7 +151,9 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
             # Absence from accepted evidence does not prove the paper omitted it.
             assessment[name] = "uncertain"
 
-    missing = [name for name in ("objective", "findings") if not coverage[name]]
+    core = ("objective", "methods", "findings") if document_type in {"empirical", "unknown"} \
+        else ("objective", "findings")
+    missing = [name for name in core if not coverage[name]]
     if not processing_error:
         if not coverage["central_findings"]:
             missing.append("central_claims_not_adequately_attributed_in_principal_sections")
@@ -148,15 +187,20 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
         source_issues.append("Table headers or footnote associations are provisional")
 
     reasons = [] if processing_error else list(problems)
-    substantive = any(e.origin == "current_study" and
-        e.category in {"finding", *NUMERIC_CATEGORIES, "conclusion"} for e in selected)
+    central_records = [e for e in reportable
+        if e.section in {"abstract", "results", "discussion", "conclusions"}
+        and e.category in RESULT_CATEGORIES]
+    substantive = coverage["central_findings"] and any(
+        e.category in RESULT_CATEGORIES and
+        (e.origin == "current_study" or document_type == "review") for e in selected)
+    adequate_attribution = substantive and (coverage["objective"] or len(central_records) >= 2)
     if processing_error:
         status = "failed"
         reasons = ["Processing failed before a validated report could be completed"]
-    elif not substantive or any(name in missing for name in ("objective", "findings")):
+    elif not adequate_attribution:
         status = "failed"
         reasons.append("Required attributable central evidence was not established")
-    elif missing or problems or source_issues or document_type == "unknown":
+    elif missing or source_issues or document_type == "unknown":
         status = "partial"
     else:
         status = "completed"
@@ -183,7 +227,7 @@ def build_synthesis_payload(selected, passages, metadata, *, max_items=9, max_ch
         if count >= max_items:
             break
         source_ids, context, unresolved = [record.passage_id], [], []
-        for context_id in (getattr(record, "context_ids", None) or []):
+        for context_id in (getattr(record, "context_ids", None) or [])[:3]:
             passage = by_id.get(context_id)
             if passage is None:
                 unresolved.append(context_id)
@@ -191,14 +235,19 @@ def build_synthesis_payload(selected, passages, metadata, *, max_items=9, max_ch
             context.append({
                 "id": passage.id, "page": passage.page, "section": passage.section,
                 "kind": getattr(passage, "kind", "text"),
-                "table_id": getattr(passage, "table_id", None), "text": passage.text[:500],
+                "table_id": getattr(passage, "table_id", None), "text": passage.text[:320],
             })
             source_ids.append(passage.id)
+        focused_source = (record.context_text or record.quote)[:700]
         item = {
             "evidence_id": record.id, "passage_id": record.passage_id, "page": record.page,
             "section": record.section, "category": record.category, "origin": record.origin,
             "attribution": record.attribution, "importance": record.importance, "value": record.value,
-            "source_text": record.quote, "source_ids": source_ids, "context": context,
+            "source_text": focused_source,
+            "source_context": (record.context_text[:700]
+                               if record.context_text and record.context_text != focused_source else ""),
+            "extraction_method": record.extraction_method,
+            "source_ids": source_ids, "context": context,
             "unresolved_context_ids": unresolved,
             "context_status": "linked" if context else ("unresolved" if unresolved else "not_linked"),
         }
@@ -219,10 +268,14 @@ def build_synthesis_payload(selected, passages, metadata, *, max_items=9, max_ch
     return payload
 
 
-def validate_narrative(narrative, payload):
+def validate_narrative_issues(narrative, payload):
     evidence = {item["evidence_id"]: item for item in payload if "evidence_id" in item}
     source_ids = {source_id for item in evidence.values() for source_id in item["source_ids"]}
-    errors, claims = [], []
+    issues, claims = [], []
+
+    def add(code, message, section=None, claim=None, details=None):
+        issues.append({"code": code, "message": message, "section": section,
+                       "claim": claim.text if claim else None, "details": details or {}})
     section_categories = {
         "introduction": {"objective", "study_design", "finding", "conclusion"},
         "methods_scope": {"study_design", "population", "sample_size", "denominator"},
@@ -236,48 +289,72 @@ def validate_narrative(narrative, payload):
         claims.extend((section, claim) for claim in (
             [value] if section == "introduction" and value else value or []))
     for section, claim in claims:
-        if _unsupported_figures(claim, evidence):
-            errors.append("Narrative figure is not an exact value in its cited numeric evidence")
+        unsupported = sorted(_unsupported_figures(claim, evidence))
+        if unsupported:
+            add("unsupported_figure",
+                "Narrative figure is not an exact value in its cited numeric evidence",
+                section, claim, {"unsupported": unsupported,
+                    "cited_evidence_ids": claim.evidence_ids})
         if claim is narrative.introduction:
             sentences = len(re.findall(r"[.!?](?:\s|$)", claim.text.strip())) or 1
             if len(claim.text) > 450 or sentences > 3:
-                errors.append("Introduction must be one short, accessible paragraph")
+                add("introduction_too_long", "Introduction must be one short, accessible paragraph",
+                    section, claim)
         if not set(claim.evidence_ids) <= evidence.keys():
-            errors.append("Narrative cites an evidence ID not supplied to synthesis")
+            add("unknown_evidence_id", "Narrative cites an evidence ID not supplied to synthesis",
+                section, claim, {"unknown": sorted(set(claim.evidence_ids) - evidence.keys())})
             continue
         if not set(claim.source_ids) <= source_ids:
-            errors.append("Narrative cites a source passage not supplied to synthesis")
+            add("unknown_source_id", "Narrative cites a source passage not supplied to synthesis",
+                section, claim, {"unknown": sorted(set(claim.source_ids) - source_ids)})
             continue
         for evidence_id in claim.evidence_ids:
             if evidence[evidence_id]["category"] not in section_categories[section]:
-                errors.append(f"Narrative uses an incompatible evidence category in {section}")
+                add("incompatible_category",
+                    f"Narrative uses an incompatible evidence category in {section}",
+                    section, claim, {"evidence_id": evidence_id,
+                                     "category": evidence[evidence_id]["category"]})
             cited_record = evidence[evidence_id]
             claim_categories = {evidence[item_id]["category"] for item_id in claim.evidence_ids}
             if ("p_value" in claim_categories and not claim_categories & {"finding", "effect_size"}
                     and re.search(r"\b(?:caus(?:e|es|ed|al)|strong(?:er)?|weak(?:er)?|large|small)\b",
                                   claim.text, re.I)):
-                errors.append("A p-value alone cannot support a causal or association-strength claim")
+                add("p_value_overinterpretation",
+                    "A p-value alone cannot support a causal or association-strength claim",
+                    section, claim)
             if not set(claim.source_ids) & set(evidence[evidence_id]["source_ids"]):
-                errors.append(f"Narrative citation does not link to evidence {evidence_id}")
+                add("unlinked_citation", f"Narrative citation does not link to evidence {evidence_id}",
+                    section, claim, {"evidence_id": evidence_id})
             item = evidence[evidence_id]
             if item.get("origin") == "cited_study":
                 attribution = item.get("attribution") or ""
                 if not ((attribution and attribution.casefold() in claim.text.casefold())
                         or re.search(r"\b(?:prior|previous|earlier|cited)\s+(?:study|research|work)\b",
                                      claim.text, re.I)):
-                    errors.append(f"Cited-study claim lacks explicit attribution for {evidence_id}")
+                    add("missing_cited_study_attribution",
+                        f"Cited-study claim lacks explicit attribution for {evidence_id}",
+                        section, claim, {"evidence_id": evidence_id})
     if narrative.introduction is None:
-        errors.append("Narrative introduction is missing")
+        add("missing_introduction", "Narrative introduction is missing")
     if not narrative.key_findings:
-        errors.append("Narrative key findings are missing")
+        add("missing_key_findings", "Narrative key findings are missing")
     key_finding_ids = {evidence_id for claim in narrative.key_findings
                        for evidence_id in claim.evidence_ids}
     primary_current_ids = {item["evidence_id"] for item in evidence.values()
         if item.get("origin") == "current_study" and item.get("importance") == "primary"
         and item.get("category") in {"finding", *NUMERIC_CATEGORIES, "conclusion"}}
     if primary_current_ids and not key_finding_ids & primary_current_ids:
-        errors.append("Key findings omit the supplied primary current-study evidence")
-    return sorted(set(errors))
+        add("missing_primary_evidence", "Key findings omit the supplied primary current-study evidence",
+            details={"primary_evidence_ids": sorted(primary_current_ids)})
+    unique = {}
+    for issue in issues:
+        key = (issue["code"], issue["section"], issue["claim"], repr(issue["details"]))
+        unique[key] = issue
+    return list(unique.values())
+
+
+def validate_narrative(narrative, payload):
+    return sorted({issue["message"] for issue in validate_narrative_issues(narrative, payload)})
 
 
 def _cite_claim(claim, evidence_by_id, passages_by_id):
@@ -295,6 +372,8 @@ def _cite_claim(claim, evidence_by_id, passages_by_id):
 
 def _numeric_context(record, width=90):
     """Show only nearby source wording while keeping the exact measure visible."""
+    if record.context_text:
+        return record.context_text
     start = max(0, record.value_start - width)
     end = min(len(record.quote), record.value_end + width)
     excerpt = record.quote[start:end].strip()
