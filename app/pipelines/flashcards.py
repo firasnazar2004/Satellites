@@ -4,7 +4,7 @@ import csv
 import re
 from pathlib import Path
 
-from app.core.llm import generate_structured
+from app.core.llm import DEFAULT_MODEL, generate_structured
 from app.models.flashcard import Flashcard, FlashcardResponse
 
 
@@ -66,7 +66,7 @@ def process_flashcard_file(
     input_path: Path,
     output_dir: Path,
     *,
-    model: str = "qwen3:8b",
+    model: str = DEFAULT_MODEL,
     max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
     cards_per_chunk: int = DEFAULT_CARDS_PER_CHUNK,
 ) -> list[Path]:

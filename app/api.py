@@ -24,6 +24,7 @@ from app.core.chat import (
     OllamaProtocolError,
     OllamaUnavailableError,
 )
+from app.core.llm import DEFAULT_MODEL, OLLAMA_BASE_URL
 from app.core.research_artifacts import research_artifacts, research_quality
 from app.core.service import JobService
 from app.models.analysis import AnalysisPlan
@@ -117,11 +118,11 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
         try:
             with httpx.Client(timeout=3, trust_env=False) as client:
                 models = (
-                    client.get("http://127.0.0.1:11434/api/tags")
+                    client.get(f"{OLLAMA_BASE_URL}/api/tags")
                     .json()
                     .get("models", [])
                 )
-            qwen = any(m["name"] == "qwen3:8b" for m in models)
+            qwen = any(m["name"] == DEFAULT_MODEL for m in models)
         except Exception:
             qwen = False
         return {
@@ -177,23 +178,23 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
         "/chat/stream",
         dependencies=[Depends(authorize)],
         tags=["Chat"],
-        description="Stream a stateless response from the server's local qwen3:8b model as NDJSON.",
+        description=f"Stream a stateless response from the server's local {DEFAULT_MODEL} model as NDJSON.",
         response_class=NDJSONStreamingResponse,
         responses={
             409: {"description": "The heavy-compute resource is busy"},
             502: {"description": "Ollama returned an unexpected response"},
-            503: {"description": "Ollama or qwen3:8b is unavailable"},
+            503: {"description": f"Ollama or {DEFAULT_MODEL} is unavailable"},
         },
     )
     async def chat(payload: ChatRequest, request: Request):
         try:
-            session = await chat_service.open(payload.messages)
+            session = await chat_service.open(payload.messages, payload.memories)
         except ChatBusyError as exc:
             raise HTTPException(
                 409, "The local AI server is busy processing another task"
             ) from exc
         except ChatModelUnavailableError as exc:
-            raise HTTPException(503, "qwen3:8b is unavailable") from exc
+            raise HTTPException(503, f"{DEFAULT_MODEL} is unavailable") from exc
         except OllamaUnavailableError as exc:
             raise HTTPException(503, "Ollama is unavailable") from exc
         except OllamaProtocolError as exc:

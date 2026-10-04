@@ -5,8 +5,9 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from app.core.jobs import create_job, run_job
 from app.core.execution import execute
+from app.core.jobs import create_job, run_job
+from app.core.llm import DEFAULT_MODEL
 from app.models.analysis import AnalysisPlan
 from app.models.dataset import SourceProfile
 from app.models.job import PipelineType
@@ -25,7 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate flashcards from a UTF-8 TXT file",
     )
     flashcards.add_argument("input", type=Path, help="Path to the source TXT file")
-    flashcards.add_argument("--model", default="qwen3:8b")
+    flashcards.add_argument("--model", default=DEFAULT_MODEL)
     flashcards.add_argument(
         "--cards-per-chunk",
         type=int,

@@ -7,7 +7,7 @@ import re
 from importlib.metadata import version
 from pathlib import Path
 
-from app.core.llm import generate_structured
+from app.core.llm import DEFAULT_MODEL, generate_structured
 from app.models.research import (
     DocumentProfile, ExtractionBatch, LimitedOverview, ResearchNarrative, SourcePassage,
 )
@@ -18,7 +18,7 @@ from app.pipelines.research_reporting import (
     render_report, select_evidence, validate_narrative,
 )
 
-MODEL = "qwen3:8b"
+MODEL = DEFAULT_MODEL
 MAX_ATTEMPTS = 3
 MAX_SYNTHESIS_ATTEMPTS = 2
 SYSTEM = (
