@@ -31,7 +31,7 @@ def research_quality(job):
         return ResearchOutcome(status="failed", processing_status="failed",
             processing_error="Quality artifact unreadable or invalid",
             reasons=["Processing ended without a valid research-quality artifact"])
-    if quality.schema_version == "2.2" and quality.report_kind == "unavailable":
+    if quality.schema_version in {"2.2", "2.3"} and quality.report_kind == "unavailable":
         report_path = job.output_dir / "research_report.md"
         if report_path.is_file():
             try:

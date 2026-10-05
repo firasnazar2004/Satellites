@@ -4,12 +4,16 @@ from datetime import datetime
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
-DocumentType = Literal["empirical", "review", "theoretical", "unknown"]
+DocumentType = Literal[
+    "empirical", "review", "theoretical", "theoretical_with_experiments", "mixed", "unknown"
+]
 Section = Literal["front_matter", "abstract", "introduction", "methods", "results",
                   "discussion", "conclusions", "limitations", "references",
                   "appendices", "excluded", "unknown"]
 Category = Literal["metadata", "objective", "study_design", "population",
                    "sample_size", "denominator", "percentage", "test_statistic",
+                   "estimate", "standard_error",
+                   "theory_claim", "assumption", "proposition", "algorithm",
                    "degrees_freedom", "statistical_warning",
                    "p_value", "confidence_interval", "effect_size",
                    "diagnostic_accuracy", "finding", "limitation", "conclusion"]
@@ -27,6 +31,11 @@ class SourcePassage(BaseModel):
     bbox: tuple[float, float, float, float]
     line_ids: list[str] = Field(default_factory=list)
     table_id: str | None = None
+    block_id: str | None = None
+    normalized_start: int | None = None
+    normalized_end: int | None = None
+    raw_start: int | None = None
+    raw_end: int | None = None
     context_ids: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
 
@@ -84,7 +93,8 @@ class ReportedMeasure(BaseModel):
     """Exact reported value plus only source-explicit relationships."""
     model_config = ConfigDict(extra="forbid")
     role: Literal["sample_size", "denominator", "percentage", "test_statistic",
-                  "degrees_freedom", "p_value", "confidence_interval", "effect_size",
+                  "estimate", "standard_error", "degrees_freedom", "p_value",
+                  "confidence_interval", "effect_size",
                   "diagnostic_accuracy"]
     exact_text: str = Field(min_length=1, max_length=240)
     label: str | None = Field(default=None, max_length=100)
@@ -110,7 +120,7 @@ class StageOutcome(BaseModel):
 
 class ResearchOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    schema_version: str = "2.3"
+    schema_version: str = "2.4"
     status: Literal["completed", "partial", "failed"]
     processing_status: Literal["completed", "failed"] = "completed"
     processing_error: str | None = None
@@ -118,6 +128,7 @@ class ResearchOutcome(BaseModel):
     reasons: list[str] = Field(default_factory=list)
     missing_coverage: list[str] = Field(default_factory=list)
     coverage: dict[str, bool] = Field(default_factory=dict)
+    coverage_by_stage: dict[str, dict[str, bool]] = Field(default_factory=dict)
     coverage_assessment: dict[str, Literal[
         "supported", "not_reported", "not_extracted", "uncertain", "not_applicable"
     ]] = Field(default_factory=dict)

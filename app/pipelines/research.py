@@ -17,7 +17,8 @@ from app.pipelines.research_sources import EXCLUDED, extract_pages
 from app.pipelines.research_validation import deduplicate, duplicate_of, literal_span, validate_proposal
 from app.pipelines.research_reporting import (
     RESEARCH_ARTIFACTS, _terms, assess_coverage, build_synthesis_payload,
-    render_limited_overview, render_report, select_evidence, validate_narrative_issues,
+    coverage_by_stage, render_limited_overview, render_report, select_evidence,
+    validate_narrative_issues,
 )
 
 MODEL = RESEARCH_MODEL
@@ -35,6 +36,9 @@ Return at most six evidence records; absent categories stay empty. value is a SH
 substring of the selected passage containing ONE fact or measure and its label. For a
 numeric measure, select the one relevant value, not a whole paragraph of numbers. Do not
 rewrite or repair the text. Python retrieves the original passage for the report.
+The context entries are neighboring source text for resolving explicit relationships only;
+return the ID of the passage containing the exact selected value. Do not infer a relationship
+from proximity without explicit wording such as “of whom ... met criteria”.
 Prioritize objectives, methods, principal results, subgroup/denominator context, conclusions,
 missing data, sampling restrictions and statistical cautions. Distinguish current_study,
 cited_study and background. Cited studies require a literal author/citation attribution
@@ -49,10 +53,14 @@ degrees_freedom: explicitly labelled df/degrees of freedom, never a sample count
 statistical_warning: explicit statistical caveat such as cells with low expected counts.
 p_value: explicit p comparison, never a significance adjective or citation.
 confidence_interval: a labelled interval with TWO bounds, not specificity or a bare range.
+estimate: a source-labelled mean, median, estimate, or benchmark score. standard_error:
+an explicitly labelled SE/standard error; mean ± SE is not a confidence interval unless
+the source labels it as a CI.
 effect_size: labelled correlation, mean difference, odds/risk ratio, etc.
 diagnostic_accuracy: sensitivity, specificity, predictive value, AUC, etc.
 For review and theoretical papers select relevant claims and methods without forcing clinical
-categories. Importance primary means central to THIS document. Never infer causality or
+categories. In theory/method papers distinguish assumptions, propositions/theorems and algorithms
+from benchmark findings. Importance primary means central to THIS document. Never infer causality or
 strength from significance. When nothing is supported, return an empty evidence list.
 """
 TARGETED_PROMPT = """Recover the requested missing evidence category from these high-relevance
@@ -174,6 +182,7 @@ def source_batches(passages, limit):
     its exact normalized-text offsets.
     """
     system = len(SYSTEM)
+    by_id = {passage.id: passage for passage in passages}
     # Includes bounded schema-repair feedback and request header fields.
     overhead_chars = system + len(EXTRACTION_PROMPT) + len(json.dumps(
         ExtractionBatch.model_json_schema(), ensure_ascii=False)) + 850
@@ -190,13 +199,33 @@ def source_batches(passages, limit):
 
     for passage in passages:
         text = passage.text
+        context = [{"id": related.id, "section": related.section,
+                    "kind": related.kind, "block_id": related.block_id,
+                    "normalized_start": related.normalized_start,
+                    "normalized_end": related.normalized_end,
+                    "text": related.text[:180]}
+                   for context_id in passage.context_ids[:3]
+                   if (related := by_id.get(context_id)) is not None]
+        omitted_context_ids = []
+
+        def make_payload(fragment_id, segment, start, end):
+            return {"id": fragment_id, "source_passage_id": passage.id,
+                    "section": passage.section, "kind": passage.kind, "text": segment,
+                    "span_start": start, "span_end": end, "context": context,
+                    "context_omitted_ids": omitted_context_ids}
+
+        base_id = passage.id + "#S0-0"
+        while context and len(json.dumps(make_payload(base_id, "", 0, 0),
+                                          ensure_ascii=False)) + 1 > payload_char_budget:
+            omitted_context_ids.append(context.pop()["id"])
+        empty_payload_size = len(json.dumps(make_payload(base_id, "", 0, 0),
+                                            ensure_ascii=False))
+        # Leave room for the variable-width source offsets and fragment ID.
+        segment_limit = payload_char_budget - empty_payload_size - 65
+        if segment_limit < 1:
+            raise ValueError("Passage " + passage.id + " context cannot fit the configured request budget")
         start = 0
         while start < len(text):
-            item_overhead = len(json.dumps({"id": passage.id, "section": passage.section,
-                "source_passage_id": passage.id, "kind": passage.kind, "text": "",
-                "span_start": 0, "span_end": 0},
-                ensure_ascii=False))
-            segment_limit = max(1, payload_char_budget - item_overhead - 24)
             end = min(len(text), start + segment_limit)
             if end < len(text):
                 sentence = max((m.end() for m in re.finditer(r"[.!?](?=\s+[A-Z])", text[start:end])),
@@ -207,9 +236,7 @@ def source_batches(passages, limit):
             segment = text[start:end]
             fragment_id = (passage.id if start == 0 and end == len(text)
                            else f"{passage.id}#S{start}-{end}")
-            payload = {"id": fragment_id, "source_passage_id": passage.id,
-                       "section": passage.section, "kind": passage.kind,
-                       "text": segment, "span_start": start, "span_end": end}
+            payload = make_payload(fragment_id, segment, start, end)
             length = len(json.dumps(payload, ensure_ascii=False))
             if batch and (size + length > payload_char_budget or len(batch) >= 6):
                 yield from flush()
@@ -274,7 +301,8 @@ def profile_document(passages, document_type, event):
         if len(sample) >= 8:
             break
     allowed = {p["id"]: p for p in sample}
-    prompt = ("Classify the document as empirical, review, theoretical or unknown. Cite passage IDs "
+    prompt = ("Classify the document as empirical, review, theoretical, theoretical_with_experiments, "
+              "mixed or unknown. Cite passage IDs "
               "supporting that classification. Extract only explicit document title/authors/year/journal/DOI; "
               "omit absent fields. Values must be exact substrings, not PDF file properties. Do not use "
               "bibliography entries or dates from other studies.\n"+json.dumps(sample, ensure_ascii=False))
@@ -287,6 +315,29 @@ def profile_document(passages, document_type, event):
     processing_errors = []
     best_type = None
     best_metadata = []
+    profile_text = " ".join(item["text"] for item in sample)
+    theory_signal = bool(re.search(
+        r"\b(?:theorem|proposition|lemma|proof|minimax|convergence proof|theoretical analysis)\b",
+        profile_text, re.I))
+    experiment_signal = bool(re.search(
+        r"\b(?:experiments?|benchmarks?|MNIST|CIFAR|TFD|evaluation on)\b", profile_text, re.I))
+
+    def supported_structural_type():
+        if theory_signal and experiment_signal:
+            return "theoretical_with_experiments"
+        if re.search(r"\b(?:systematic review|meta-analysis|PRISMA)\b", profile_text, re.I):
+            return "review"
+        if theory_signal:
+            return "theoretical"
+        empirical_sections = {item["section"] for item in sample}
+        empirical_content = bool(re.search(
+            r"\b(?:participants?|patients?|sample size|cross-sectional|cohort|randomi[sz]ed|"
+            r"survey|eligible|inclusion criteria)\b", profile_text, re.I))
+        if {"methods", "results"} <= empirical_sections and empirical_content:
+            return "empirical"
+        return None
+
+    structural_type = supported_structural_type()
     for attempt in range(MAX_ATTEMPTS):
         try:
             profile = generate_structured(
@@ -303,6 +354,10 @@ def profile_document(passages, document_type, event):
                 problems.append("Document type lacks valid source IDs")
             elif profile.document_type != "unknown":
                 best_type = profile.document_type
+            if structural_type == "theoretical_with_experiments":
+                # Explicit proofs/theorems plus named evaluation benchmarks identify
+                # a theory/method paper with experiments, not a clinical study.
+                best_type = structural_type
             valid_metadata = []
             for field in profile.metadata:
                 p = allowed.get(field.passage_id)
@@ -332,9 +387,14 @@ def profile_document(passages, document_type, event):
             best_metadata = valid_metadata if len(valid_metadata) > len(best_metadata) else best_metadata
             event({"stage": "profile", "attempt": attempt+1, "problems": problems,
                    "source_ids": list(allowed), "response": profile.model_dump()})
+            if structural_type and (not type_supported or profile.document_type == "unknown"):
+                event({"stage": "profile_structural_recovery", "document_type": structural_type,
+                       "reason": "grounded title/abstract/body structure; model type source ID unusable"})
+                return (document_type if document_type != "auto" else structural_type), valid_metadata, [], []
             if type_supported and profile.document_type != "unknown":
                 # Optional bad metadata never discards a grounded type decision.
-                return (document_type if document_type != "auto" else profile.document_type), valid_metadata, [], []
+                return (document_type if document_type != "auto" else
+                        (best_type or profile.document_type)), valid_metadata, [], []
             if document_type != "auto" and not problems:
                 return document_type, valid_metadata, [], []
             prompt += "\nCorrect these errors, omitting unsupported metadata: "+"; ".join(problems)
@@ -348,8 +408,12 @@ def profile_document(passages, document_type, event):
         return ("unknown" if document_type == "auto" else document_type), [], [], [
             "Document profiling failed after bounded model attempts: " + processing_errors[-1]
         ]
-    return ("unknown" if document_type == "auto" else document_type), [], [
-        "Document type or metadata could not be established"
+    if structural_type:
+        event({"stage": "profile_structural_recovery", "document_type": structural_type,
+               "reason": "explicit structural signals after bounded classifier retries"})
+        return (document_type if document_type != "auto" else structural_type), best_metadata, [], []
+    return ("unknown" if document_type == "auto" else document_type), best_metadata, [
+        "Document type remains uncertain after bounded classification"
     ], []
 
 
@@ -381,25 +445,14 @@ def _targeted_candidates(passages, category, limit=6):
 
 
 def _deterministic_target_value(passage, category):
-    """Return a bounded literal only for strong structural/cue matches."""
-    cue = TARGET_CUES[category]
-    pieces = [piece.strip() for piece in re.split(r"(?<=[.!?])\s+|\s*[;]\s*", passage.text)
-              if piece.strip()]
-    matches = [piece for piece in pieces if cue.search(piece) and len(piece) <= 240]
-    if matches:
-        return matches[0]
-    if category == "conclusion" and passage.section == "conclusions":
-        complete = [piece for piece in pieces if len(piece.split()) >= 6 and len(piece) <= 240]
-        return complete[0] if complete else None
-    if len(passage.text) <= 240 and cue.search(passage.text):
-        return passage.text
+    """Do not turn a lexical cue into a semantic evidence classification."""
     return None
 
 
 def recover_structural_evidence(passages, records, rejected, document_type, source, event):
     """Target missing structural categories before research-readiness assessment."""
     required = ["objective", "conclusion", "limitation"]
-    if document_type in {"empirical", "unknown"}:
+    if document_type == "empirical":
         required[1:1] = ["study_design", "population"]
     outcomes = []
     for category in required:
@@ -435,7 +488,14 @@ def recover_structural_evidence(passages, records, rejected, document_type, sour
                 break
         if outcome["accepted_ids"]:
             continue
-        payload = [{"id": p.id, "section": p.section, "kind": p.kind, "text": p.text}
+        passage_by_id = {p.id: p for p in passages}
+        payload = [{"id": p.id, "section": p.section, "kind": p.kind, "text": p.text,
+                    "context": [{"id": neighbor.id, "section": neighbor.section,
+                                 "kind": neighbor.kind, "block_id": neighbor.block_id,
+                                 "normalized_start": neighbor.normalized_start,
+                                 "text": neighbor.text[:180]}
+                                for context_id in p.context_ids[:3]
+                                if (neighbor := passage_by_id.get(context_id)) is not None]}
                    for p in candidates]
         base_prompt = (TARGETED_PROMPT + f"\nDocument type: {document_type}"
                        f"\nRequested category: {category}\n" +
@@ -470,7 +530,9 @@ def recover_structural_evidence(passages, records, rejected, document_type, sour
                     else:
                         item, reasons = validate_proposal(
                             proposal, allowed[proposal.passage_id], source=source,
-                            evidence_id=_next_evidence_id(records), document_type=document_type)
+                            evidence_id=_next_evidence_id(records), document_type=document_type,
+                            related_passages=next((item["context"] for item in payload
+                                if item["id"] == proposal.passage_id), []))
                     if reasons:
                         rejected.append({"stage": "targeted_recovery", "category_requested": category,
                             "attempt": attempt + 1, **proposal.model_dump(),
@@ -618,7 +680,8 @@ def generate_limited_overview(passages, pages, event):
             if not set(result.source_ids) <= locations.keys():
                 validation.append("Overview cites an unknown source ID")
             event({"stage": "limited_overview", "attempt": attempt + 1,
-                   "source_ids": result.source_ids, "validation_errors": validation})
+                   "source_ids": result.source_ids, "draft": result.overview[:500],
+                   "validation_errors": validation})
             if not validation:
                 return result, locations, ""
             errors.extend(validation)
@@ -631,36 +694,128 @@ def generate_limited_overview(passages, pages, event):
 
 
 def generate_research_narrative(selected, passages, metadata, event):
-    schema_chars = len(json.dumps(ResearchNarrative.model_json_schema(), ensure_ascii=False))
-    fixed_chars = len(SYNTHESIS_SYSTEM) + len(SYNTHESIS_PROMPT) + schema_chars + 320
-    payload_limit = max(0, 3 * (4096 - 1800) - fixed_chars - 500)
-    payload = build_synthesis_payload(selected, passages, metadata, max_chars=payload_limit)
+    # Plan one bounded call per report section so selected bundles do not have to
+    # compete inside a single all-or-nothing response.
+    payload = build_synthesis_payload(selected, passages, metadata, max_items=9, max_chars=40000)
     if not any("evidence_id" in item for item in payload):
         return None, ["No validated evidence fit the bounded synthesis input"], payload, []
-    serialized = json.dumps(payload, ensure_ascii=False)
-    prompt = SYNTHESIS_PROMPT + "\nValidated records and linked passages:\n" + serialized
-    budget = request_budget(prompt, ResearchNarrative, system_prompt=SYNTHESIS_SYSTEM)
-    event({"stage": "synthesis_budget", **budget})
-    if budget["estimated_total_tokens_with_output_reserve"] > 4096:
-        attempts = [{"attempt": 1, "failure_kind": "request_budget",
-                    "budget": budget,
-                    "error": "Synthesis request exceeds the configured context budget"}]
-        return None, [attempts[0]["error"]], payload, attempts
-    attempts = []
-    try:
-        narrative = generate_structured(prompt, ResearchNarrative, model=MODEL,
-                                        system_prompt=SYNTHESIS_SYSTEM,
-                                        keep_alive=KEEP_ALIVE)
-    except Exception as exc:
-        message = f"{type(exc).__name__}: {str(exc)[:500]}"
-        attempts.append({"attempt": 1, "failure_kind": "transport_or_schema", "error": message})
-        event({"stage": "synthesis", **attempts[-1]})
-        return None, [message], payload, attempts
+    section_categories = {
+        "introduction": {"objective", "study_design", "theory_claim"},
+        "methods_scope": {"study_design", "assumption", "proposition", "algorithm",
+                          "population", "sample_size", "denominator"},
+        "key_findings": {"finding", "percentage", "test_statistic", "p_value", "estimate",
+                         "standard_error", "confidence_interval", "effect_size",
+                         "diagnostic_accuracy", "theory_claim", "proposition", "conclusion"},
+        "statistical_information": {"sample_size", "denominator", "percentage", "test_statistic",
+            "estimate", "standard_error", "degrees_freedom", "p_value", "confidence_interval",
+            "effect_size", "diagnostic_accuracy", "statistical_warning"},
+        "conclusion": {"finding", "percentage", "test_statistic", "p_value", "estimate",
+            "standard_error", "degrees_freedom", "confidence_interval", "effect_size",
+            "diagnostic_accuracy", "theory_claim", "proposition", "statistical_warning",
+            "conclusion", "limitation"},
+    }
+    compact_prompt = (SYNTHESIS_PROMPT + "\nValidated records and linked passages:\n"
+                      + json.dumps(payload, ensure_ascii=False))
+    compact_budget = request_budget(compact_prompt, ResearchNarrative,
+                                    system_prompt=SYNTHESIS_SYSTEM)
+    compact_request = compact_budget["estimated_total_tokens_with_output_reserve"] <= 4096
+    event({"stage": "synthesis_compact_budget", **compact_budget,
+           "fits_single_request": compact_request})
+    if compact_request:
+        section_categories = {"all_sections": set().union(*section_categories.values())}
+    narrative = ResearchNarrative()
+    attempts, sent_payload, errors = [], {}, []
+    for call_number, section in enumerate(section_categories, 1):
+        section_payload = [item for item in payload if "evidence_id" in item
+                           and item["category"] in section_categories[section]]
+        if section in {"introduction", "all_sections"}:
+            section_payload += [item for item in payload if "bibliographic_metadata" in item]
+        if not section_payload:
+            attempts.append({"attempt": call_number, "stage": "section_synthesis",
+                             "section": section, "status": "not_applicable",
+                             "provided_ids": []})
+            continue
+        response_model = (ResearchNarrative if compact_request else
+                          IntroductionRepair if section == "introduction" else CitedClaimSet)
+        section_prompt = (SYNTHESIS_PROMPT + "\nValidated records and linked passages:\n"
+            if compact_request else SYNTHESIS_PROMPT + "\nWrite only the " + section + " section. "
+            "The supplied evidence and source IDs are the complete allowed inputs for this call.\n")
+        section_prompt += json.dumps(section_payload, ensure_ascii=False)
+        budget = request_budget(section_prompt, response_model, system_prompt=SYNTHESIS_SYSTEM)
+        if budget["estimated_total_tokens_with_output_reserve"] > 4096:
+            failure = {"attempt": call_number, "stage": "section_synthesis", "section": section,
+                       "failure_kind": "request_budget", "budget": budget,
+                       "error": "Section evidence bundle exceeds the configured context budget"}
+            attempts.append(failure)
+            errors.append(failure["error"] + " (" + section + ")")
+            event({"stage": "synthesis_section", **failure})
+            continue
+        event({"stage": "synthesis_section_budget", "section": section, **budget})
+        for item in section_payload:
+            if "evidence_id" in item:
+                sent_payload[item["evidence_id"]] = item
+        try:
+            result = generate_structured(section_prompt, response_model, model=MODEL,
+                system_prompt=SYNTHESIS_SYSTEM, keep_alive=KEEP_ALIVE)
+            if section == "all_sections":
+                narrative = result
+                revised = result.introduction
+            elif section == "introduction":
+                revised = result.claim
+            else:
+                revised = result.claims
+            if section != "all_sections":
+                narrative = narrative.model_copy(update={section: revised})
+            supplied_ids = {item["evidence_id"] for item in section_payload
+                            if "evidence_id" in item}
+            if section == "all_sections":
+                claims = [result.introduction] if result.introduction else []
+                for field in ("methods_scope", "key_findings", "statistical_information", "conclusion"):
+                    claims.extend(getattr(result, field))
+            else:
+                claims = ([revised] if section == "introduction" and revised else
+                          revised if section != "introduction" else [])
+            unknown_evidence = sorted({ident for claim in claims for ident in claim.evidence_ids
+                                       if ident not in supplied_ids})
+            supplied_sources = {ident for item in section_payload for ident in item.get("source_ids", [])}
+            unknown_sources = sorted({ident for claim in claims for ident in claim.source_ids
+                                      if ident not in supplied_sources})
+            if unknown_evidence or unknown_sources:
+                if section == "all_sections":
+                    narrative = ResearchNarrative()
+                else:
+                    narrative = narrative.model_copy(update={section: None if section == "introduction" else []})
+            result_info = {"attempt": call_number, "stage": "section_synthesis",
+                "section": section, "status": "drafted", "provided_ids": sorted(supplied_ids),
+                "narrative": (result.model_dump()),
+                "unknown_evidence_ids": unknown_evidence, "unknown_source_ids": unknown_sources}
+            attempts.append(result_info)
+            event({"stage": "synthesis_section", **result_info})
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {str(exc)[:500]}"
+            failure = {"attempt": call_number, "stage": "section_synthesis", "section": section,
+                       "failure_kind": "transport_or_schema", "error": message}
+            attempts.append(failure)
+            errors.append(message)
+            event({"stage": "synthesis_section", **failure})
 
+    payload = list(sent_payload.values())
+    if not payload:
+        return None, errors or ["No complete evidence bundle fit a section synthesis request"], payload, attempts
+    if errors:
+        # Keep successful section drafts for a partial report while the caller
+        # records transport/schema failure separately from expected omissions.
+        return narrative, errors, payload, attempts
     issues = validate_narrative_issues(narrative, payload)
-    attempts.append({"attempt": 1, "narrative": narrative.model_dump(),
-                     "validation_issues": issues})
-    event({"stage": "synthesis", **attempts[-1], "validation_errors":
+    validation_attempt = {"attempt": len(section_categories) + 1,
+        "stage": "section_validation", "narrative": narrative.model_dump(),
+        "validation_issues": issues}
+    if compact_request:
+        attempts = [{"attempt": 1, "narrative": narrative.model_dump(),
+                     "validation_issues": issues}]
+    else:
+        attempts.append(validation_attempt)
+    event({"stage": "synthesis", **validation_attempt, "validation_errors":
            sorted({issue["message"] for issue in issues})})
     invalid_by_section = {}
     for issue in issues:
@@ -696,7 +851,8 @@ def generate_research_narrative(selected, passages, metadata, event):
             if section == "key_findings":
                 candidates = [item for item in candidates
                               if item.get("importance") == "primary" or item["category"] in
-                              {"finding", "percentage", "test_statistic", "p_value"}]
+                              {"finding", "percentage", "test_statistic", "p_value",
+                               "theory_claim", "proposition"}]
             wanted_ids.update(item["evidence_id"] for item in candidates[:4])
         repair_payload = [item for item in payload if item.get("evidence_id") in wanted_ids]
         repair_prompt = (
@@ -767,7 +923,8 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
                           document_type="auto", reading_order="auto") -> list[Path]:
     if not 500 <= max_chunk_chars <= 4000:
         raise ValueError("Research chunk size must be between 500 and 4000 characters")
-    if document_type not in {"auto", "empirical", "review", "theoretical"}:
+    if document_type not in {"auto", "empirical", "review", "theoretical",
+                              "theoretical_with_experiments", "mixed"}:
         raise ValueError("Unsupported document_type")
     if reading_order not in {"auto", "single", "two", "three"}:
         raise ValueError("Unsupported reading_order")
@@ -777,13 +934,13 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
     pages, sources, records, rejected, chunks, problems, processing_errors = [], [], [], [], [], [], []
     resolved_type, metadata, extraction_complete = "unknown", [], False
     source_hash = hashlib.sha256()
-    config = {"schema_version": "2.3", "model": MODEL, "python": platform.python_version(),
+    config = {"schema_version": "2.4", "model": MODEL, "python": platform.python_version(),
               "pdfplumber": version("pdfplumber"), "pydantic": version("pydantic"),
               "ollama_client": version("ollama"), "max_chunk_chars": max_chunk_chars,
               "reading_order": reading_order, "requested_document_type": document_type,
               "max_extraction_attempts": MAX_ATTEMPTS,
               "max_targeted_attempts": MAX_TARGETED_ATTEMPTS,
-              "max_synthesis_drafts": 1,
+              "max_synthesis_section_calls": 5,
               "max_synthesis_section_repairs": MAX_SYNTHESIS_REPAIR_CALLS,
               "transport_retries_per_model_call": 3,
               "source_sha256": "unavailable",
@@ -811,14 +968,14 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
 
     def checkpoint(quality=None):
         write_json(output_dir / "evidence.json", {
-            "schema_version": "2.3", "source": input_path.name,
+            "schema_version": "2.4", "source": input_path.name,
             "evidence": [e.model_dump() for e in records], "metadata": metadata,
             "document_type": resolved_type,
             "validation": "Exact passage grounding and conservative category checks; semantic correctness requires review",
         })
         write_json(output_dir / "rejected_evidence.json", rejected)
         write_json(output_dir / "research_diagnostics.json", {
-            "schema_version": "2.3",
+            "schema_version": "2.4",
             "configuration": config, "processing_errors": processing_errors,
             "timings_seconds": dict(timings, total=time.monotonic()-overall_started),
             "problems": problems, "synthesis_errors": diagnostics["synthesis_errors"],
@@ -827,7 +984,7 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
             "numeric_companion_recovery": diagnostics["numeric_companion_recovery"],
             "overview_error": diagnostics["overview_error"], "chunks": chunks,
             "selection": diagnostics["selection"],
-            "schema_versions": {"research": "2.3", "source_passage": "1"},
+            "schema_versions": {"research": "2.4", "source_passage": "1"},
             "unresolved_context_ids": diagnostics["unresolved_context_ids"],
             "skipped_background_passage_ids": diagnostics.get("skipped_background_passage_ids", []),
             "quality": quality.model_dump() if quality else None,
@@ -884,8 +1041,10 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
                            "source_passage_ids": sorted({item["source_passage_id"]
                                                           for item in batch}),
                            "fragments": [{"fragment_id": item["id"],
-                               "source_passage_id": item["source_passage_id"],
-                               "span_start": item["span_start"], "span_end": item["span_end"]}
+                           "source_passage_id": item["source_passage_id"],
+                               "span_start": item["span_start"], "span_end": item["span_end"],
+                               "context_ids": [context["id"] for context in item.get("context", [])],
+                               "context_omitted_ids": item.get("context_omitted_ids", [])}
                                for item in batch],
                            "attempts": [], "status": "pending"}
                 chunks.append(outcome)
@@ -912,7 +1071,8 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
                                 item, reasons = validate_proposal(
                                     proposal, by_id[source_passage_id], source=input_path.name,
                                     evidence_id=_next_evidence_id(records), document_type=resolved_type,
-                                    span_bounds=(fragment["span_start"], fragment["span_end"]))
+                                    span_bounds=(fragment["span_start"], fragment["span_end"]),
+                                    related_passages=fragment.get("context", []))
                             if reasons:
                                 rejection = {
                                     "chunk": index, "attempt": attempt + 1, **proposal.model_dump(),
@@ -984,7 +1144,7 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
             "reason": ("explicit central objective" if record.category == "objective" else
                 "central result candidate" if record.category in {"finding", "percentage",
                     "test_statistic", "p_value", "confidence_interval", "effect_size",
-                    "diagnostic_accuracy"} and record.section in {
+                    "diagnostic_accuracy", "theory_claim", "proposition"} and record.section in {
                     "abstract", "results", "discussion", "conclusions"} else
                 "source-linked statistical bundle" if record.category in {
                     "degrees_freedom", "statistical_warning", "test_statistic", "p_value"} else
@@ -997,7 +1157,7 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
                                         _terms(result.context_text or result.quote))}
                 for result in selected if result.category in {"finding", "percentage",
                     "test_statistic", "p_value", "confidence_interval", "effect_size",
-                    "diagnostic_accuracy"}
+                    "diagnostic_accuracy", "theory_claim", "proposition"}
                 and (_terms(objective.value + " " + objective.quote) &
                      _terms(result.context_text or result.quote))],
             "assessment": "lexical candidate link only; check source semantics"
@@ -1006,6 +1166,7 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
         "budget_omitted_ids": [],
         "central_result_ids": [record.id for record in selected
             if record.category in {"finding", "percentage", "test_statistic", "p_value",
+                                   "estimate", "standard_error", "theory_claim", "proposition",
                                    "confidence_interval", "effect_size", "diagnostic_accuracy"}
             and record.section in {"abstract", "results", "discussion", "conclusions"}],
     }
@@ -1046,10 +1207,11 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
         provided_ids = {item["evidence_id"] for item in synthesis_payload if "evidence_id" in item}
         omitted_from_synthesis = {e.id for e in selected} - provided_ids
         diagnostics["selection"]["budget_omitted_ids"] = sorted(omitted_from_synthesis)
+        diagnostics["selection"]["provided_ids"] = sorted(provided_ids)
+        diagnostics["selection"]["omitted_from_synthesis_ids"] = sorted(omitted_from_synthesis)
         if omitted_from_synthesis and not synthesis_errors:
             quality.missing_coverage.append("some selected evidence was outside the bounded synthesis input")
             quality.missing_coverage = sorted(set(quality.missing_coverage))
-            quality.selected_records = len(provided_ids)
             if quality.status == "completed":
                 quality.status = "partial"
             if not overview_attempted:
@@ -1080,6 +1242,35 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
                     write_json(output_dir / "passages.json",
                                [item for page in pages for item in page.get("passages", [])])
 
+    provided_ids = {item["evidence_id"] for item in synthesis_payload if "evidence_id" in item}
+    quality.coverage_by_stage = coverage_by_stage(records, selected, provided_ids, narrative)
+    final_coverage = quality.coverage_by_stage["rendered"]
+    required_final = {"objective", "findings", "conclusions", "limitations"}
+    if resolved_type != "unknown":
+        required_final.add("methods")
+    final_gaps = [category for category in sorted(required_final)
+                  if any(record.category in {
+                      "objective": {"objective"},
+                      "methods": {"study_design", "assumption", "proposition", "algorithm"},
+                      "findings": {"finding", "percentage", "test_statistic", "p_value",
+                                   "estimate", "standard_error", "theory_claim", "proposition",
+                                   "confidence_interval",
+                                   "effect_size", "diagnostic_accuracy"},
+                      "conclusions": {"conclusion"},
+                      "limitations": {"limitation"},
+                  }[category] for record in records)
+                  and not final_coverage.get(category, False)]
+    if final_gaps:
+        quality.missing_coverage.extend("final_report_" + category for category in final_gaps)
+        quality.missing_coverage = sorted(set(quality.missing_coverage))
+        if quality.status == "completed":
+            quality.status = "partial"
+        if quality.status == "partial" and not narrative:
+            quality.status = "failed"
+
+    diagnostics["selection"]["coverage_by_stage"] = quality.coverage_by_stage
+    diagnostics["selection"]["final_report_gaps"] = final_gaps
+
     if processing_error or quality.status != "completed":
         reason = processing_error or "; ".join(
             (quality.reasons[-1:] + quality.missing_coverage)[:4])
@@ -1088,9 +1279,18 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
         limited = render_limited_overview(input_path.name, overview, locations, quality, reason)
         save_text("research_limited_overview.md", limited)
     if processing_error or quality.status == "failed" or narrative is None:
-        save_text("research_report.md", limited)
-        quality.report_availability = "partial"
-        quality.report_kind = "limited_overview"
+        report_records = [e for e in selected if e.id in provided_ids]
+        if processing_error and narrative and any((narrative.introduction,
+                narrative.methods_scope, narrative.key_findings,
+                narrative.statistical_information, narrative.conclusion)):
+            save_text("research_report.md", render_report(
+                input_path.name, report_records, sources, metadata, quality, narrative))
+            quality.report_availability = "partial"
+            quality.report_kind = "partial_report"
+        else:
+            save_text("research_report.md", limited)
+            quality.report_availability = "partial"
+            quality.report_kind = "limited_overview"
     else:
         provided_ids = {item["evidence_id"] for item in synthesis_payload if "evidence_id" in item}
         report_records = [e for e in selected if e.id in provided_ids]
@@ -1130,7 +1330,8 @@ def process_research_file(input_path: Path, output_dir: Path, *, max_chunk_chars
     write_json(output_dir / "passages.json",
                [item for page in pages for item in page.get("passages", [])])
     write_json(output_dir / "synthesis.json", {
-        "schema_version": "2.3", "status": "completed" if narrative else "not_generated",
+        "schema_version": "2.4", "status": (
+            "not_generated" if narrative is None else "partial" if synthesis_errors else "completed"),
         "attempt_errors": synthesis_errors,
         "attempts": synthesis_attempts,
         "provided_evidence_ids": [item["evidence_id"] for item in synthesis_payload

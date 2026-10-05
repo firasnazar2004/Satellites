@@ -12,15 +12,28 @@ RESEARCH_ARTIFACTS = (
 )
 NUMERIC_CATEGORIES = {
     "sample_size", "denominator", "percentage", "test_statistic", "p_value",
+    "estimate", "standard_error",
     "degrees_freedom", "confidence_interval", "effect_size", "diagnostic_accuracy",
 }
 RESULT_CATEGORIES = {
     "finding", "percentage", "test_statistic", "p_value", "confidence_interval",
-    "effect_size", "diagnostic_accuracy",
+    "estimate", "standard_error", "effect_size", "diagnostic_accuracy",
+    "theory_claim", "proposition",
+}
+COVERAGE_GROUPS = {
+    "objective": {"objective"},
+    "methods": {"study_design", "assumption", "proposition", "algorithm"},
+    "population": {"population", "sample_size", "denominator"},
+    "findings": RESULT_CATEGORIES,
+    "statistics": NUMERIC_CATEGORIES | {"statistical_warning"},
+    "conclusions": {"conclusion"},
+    "limitations": {"limitation"},
 }
 NUMBER_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9.])[+−-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?(?![A-Za-z0-9%])"
+    r"(?<![A-Za-z0-9.])[+−-]?(?:\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?|\.\d+)(?:[eE][+−-]?\d+)?%?(?![A-Za-z0-9%])"
 )
+LABEL_NUMBER = re.compile(r"\b\d+\s*[- ]sided\b", re.I)
+P_COMPARISON = re.compile(r"\bp(?:[- ]?value)?\s*(<=|>=|≤|≥|<|>|=)\s*([+−-]?(?:\d+(?:\.\d+)?|\.\d+))", re.I)
 NUMBER_WORD = re.compile(
     r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
     r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
@@ -62,7 +75,8 @@ def _unsupported_figures(claim, evidence):
     allowed = {
         match.group().casefold() for value in cited_values for match in NUMBER_TOKEN.finditer(value)
     }
-    unsupported = {match.group() for match in NUMBER_TOKEN.finditer(claim.text)
+    numeric_claim_text = LABEL_NUMBER.sub("", claim.text)
+    unsupported = {match.group() for match in NUMBER_TOKEN.finditer(numeric_claim_text)
                    if match.group().casefold() not in allowed}
     supported_text = " ".join(cited_values).casefold()
     unsupported.update(match.group() for match in NUMBER_WORD.finditer(claim.text)
@@ -135,7 +149,7 @@ def select_evidence(records, document_type, limit=9):
                and e.section in {"abstract", "results", "discussion", "conclusions"}
                and e not in selected]
     supporting_categories = {"study_design", "population", "sample_size", "denominator",
-                            "conclusion", "limitation"}
+                            "conclusion", "limitation", "assumption", "proposition", "algorithm"}
     supporting_available = sum(1 for item in ranked if item.category in supporting_categories)
     seed_limit = max(1, min(3, limit - len(selected) - supporting_available))
     seeds = []
@@ -160,7 +174,8 @@ def select_evidence(records, document_type, limit=9):
 
     # Fill remaining capacity by objective relevance and document coverage.
     supporting = {"study_design", "population", "sample_size", "denominator",
-                  "conclusion", "limitation", "degrees_freedom", "statistical_warning"}
+                  "conclusion", "limitation", "degrees_freedom", "statistical_warning",
+                  "assumption", "proposition", "algorithm"}
     for record in ranked:
         if record.category in supporting:
             add(record, bundle=record.category in {"degrees_freedom", "statistical_warning"})
@@ -179,7 +194,8 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
     ]
     coverage = {
         "objective": any(e.category == "objective" for e in own),
-        "methods": any(e.category == "study_design" for e in own),
+        "methods": any(e.category in {"study_design", "assumption", "proposition", "algorithm"}
+                        for e in own),
         "population": any(e.category in {"population", "sample_size", "denominator"} for e in own),
         "findings": any(e.category in RESULT_CATEGORIES for e in reportable),
         "conclusions": any(e.category == "conclusion" for e in own),
@@ -202,10 +218,14 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
     applicable = {
         "empirical": {"objective", "methods", "findings", "conclusions", "limitations",
                       "population", "sample_size", "denominator", "statistics"},
-        "review": {"objective", "findings", "conclusions", "limitations", "statistics"},
-        "theoretical": {"objective", "findings", "conclusions", "limitations"},
-        "unknown": {"objective", "methods", "findings", "conclusions", "limitations",
-                    "population", "sample_size", "denominator", "statistics"},
+        "review": {"objective", "methods", "findings", "conclusions", "limitations", "statistics"},
+        "theoretical": {"objective", "methods", "findings", "conclusions", "limitations"},
+        "theoretical_with_experiments": {"objective", "methods", "findings", "conclusions", "limitations",
+                                         "statistics"},
+        "mixed": {"objective", "methods", "findings", "conclusions", "limitations",
+                  "statistics"},
+        # Unknown is uncertainty; it must not inherit empirical population/denominator duties.
+        "unknown": {"objective", "findings", "conclusions"},
     }[document_type]
     observed = {
         "objective": coverage["objective"], "methods": coverage["methods"],
@@ -228,8 +248,16 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
             # Absence from accepted evidence does not prove the paper omitted it.
             assessment[name] = "uncertain"
 
-    core = ("objective", "methods", "findings") if document_type in {"empirical", "unknown"} \
-        else ("objective", "findings")
+    core = {
+        "empirical": ("objective", "methods", "findings", "conclusions", "limitations"),
+        "mixed": ("objective", "methods", "findings", "conclusions", "limitations"),
+        "review": ("objective", "methods", "findings", "conclusions", "limitations"),
+        "theoretical": ("objective", "methods", "findings", "conclusions", "limitations"),
+        "theoretical_with_experiments":
+            ("objective", "methods", "findings", "conclusions", "limitations"),
+        # Keep unknown type safe; the other empirical fields stay uncertain.
+        "unknown": ("objective", "findings"),
+    }[document_type]
     missing = [name for name in core if not coverage[name]]
     if not processing_error:
         if not coverage["central_findings"]:
@@ -243,7 +271,7 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
         if uncovered:
             missing.append("results_pages_without_evidence: " + ", ".join(map(str, uncovered)))
         if document_type == "unknown":
-            missing.append("document_type_unresolved")
+            missing.append("document_type_unresolved; empirical applicability remains uncertain")
         if not extraction_complete:
             missing.append("extraction_interrupted")
 
@@ -294,6 +322,34 @@ def assess_coverage(records, selected, document_type, *, extraction_complete,
         rejected_attempts=rejected_attempts, selected_records=len(selected),
         extraction_complete=extraction_complete,
     )
+
+
+def coverage_by_stage(records, selected, supplied, narrative):
+    """Keep extraction, selection, synthesis input, validation and rendering distinct."""
+    record_by_id = {record.id: record for record in records}
+    supplied_ids = set(supplied)
+    validated_ids = set()
+    if narrative is not None:
+        claims = [narrative.introduction] if narrative.introduction else []
+        for section in ("methods_scope", "key_findings", "statistical_information", "conclusion"):
+            claims.extend(getattr(narrative, section))
+        validated_ids = {evidence_id for claim in claims for evidence_id in claim.evidence_ids
+                         if evidence_id in record_by_id}
+    rendered_ids = set(validated_ids)
+    rendered_ids.update(record.id for record in selected
+                        if record.id in supplied_ids and
+                        record.category in NUMERIC_CATEGORIES | {"statistical_warning"})
+    stages = {
+        "extracted": set(record_by_id),
+        "selected": {record.id for record in selected},
+        "supplied_to_synthesis": supplied_ids,
+        "validated": validated_ids,
+        "rendered": rendered_ids,
+    }
+    return {stage: {category: any(
+        evidence_id in record_by_id and record_by_id[evidence_id].category in allowed
+        for evidence_id in ids) for category, allowed in COVERAGE_GROUPS.items()}
+        for stage, ids in stages.items()}
 
 
 def escape(text):
@@ -361,11 +417,14 @@ def validate_narrative_issues(narrative, payload):
                        "claim": claim.text if claim else None, "details": details or {}})
     section_categories = {
         "introduction": {"objective", "study_design", "finding", "conclusion"},
-        "methods_scope": {"study_design", "population", "sample_size", "denominator"},
-        "key_findings": {"finding", *NUMERIC_CATEGORIES, "conclusion", "study_design",
+        "methods_scope": {"study_design", "assumption", "proposition", "algorithm",
+                           "population", "sample_size", "denominator"},
+        "key_findings": {"finding", "theory_claim", "proposition", *NUMERIC_CATEGORIES,
+                         "conclusion", "study_design", "assumption", "algorithm",
                          "population", "sample_size", "denominator"},
         "statistical_information": NUMERIC_CATEGORIES | {"statistical_warning"},
-        "conclusion": {"finding", "conclusion", "limitation", *NUMERIC_CATEGORIES},
+        "conclusion": {"finding", "theory_claim", "proposition", "conclusion", "limitation",
+                       *NUMERIC_CATEGORIES},
     }
     for section in ("introduction", "methods_scope", "key_findings",
                     "statistical_information", "conclusion"):
@@ -379,6 +438,14 @@ def validate_narrative_issues(narrative, payload):
                 "Narrative figure is not an exact value in its cited numeric evidence",
                 section, claim, {"unsupported": unsupported,
                     "cited_evidence_ids": claim.evidence_ids})
+        cited_categories = {evidence[item_id]["category"] for item_id in claim.evidence_ids
+                            if item_id in evidence}
+        if (re.search(r"\b(?:warning|caution|expected cell|expected count|assumption)\b",
+                      claim.text, re.I)
+                and "statistical_warning" not in cited_categories):
+            add("missing_warning_evidence",
+                "A statistical caution must cite its own validated warning evidence record",
+                section, claim)
         if claim is narrative.introduction:
             sentences = len(re.findall(r"[.!?](?:\s|$)", claim.text.strip())) or 1
             if len(claim.text) > 450 or sentences > 3:
@@ -406,6 +473,20 @@ def validate_narrative_issues(narrative, payload):
                         "Methods, population, and denominator context cannot stand alone as a finding",
                         section, claim)
             cited_record = evidence[evidence_id]
+            if cited_record["category"] == "p_value":
+                source_measure = cited_record.get("measure") or {}
+                source_text = source_measure.get("exact_text") or cited_record.get("value", "")
+                source_comparison = P_COMPARISON.search(source_text)
+                claim_comparison = P_COMPARISON.search(claim.text)
+                if source_comparison and claim_comparison and (
+                    source_comparison.group(1) != claim_comparison.group(1)
+                    or source_comparison.group(2) != claim_comparison.group(2)
+                ):
+                    add("p_value_comparison_mismatch",
+                        "Narrative changes the source p-value comparison or value",
+                        section, claim, {"evidence_id": evidence_id,
+                            "source_comparison": source_comparison.group(0),
+                            "claim_comparison": claim_comparison.group(0)})
             claim_groups = _group_terms(claim.text)
             if claim_groups and cited_record["category"] in NUMERIC_CATEGORIES:
                 measure = cited_record.get("measure") or {}
@@ -555,7 +636,7 @@ def render_report(source, selected, passages, metadata, outcome, narrative=None)
             continue
         claims = getattr(narrative, field)
         claims = [claims] if single and claims else ([] if single else claims)
-        stats = [e for e in selected if e.category in NUMERIC_CATEGORIES] \
+        stats = [e for e in selected if e.category in NUMERIC_CATEGORIES | {"statistical_warning"}] \
                 if field == "statistical_information" else []
         if not claims and not stats:
             lines += ["No supported material was extracted for this section.", ""]
@@ -595,7 +676,7 @@ def render_limited_overview(source, overview, source_locations, outcome, reason)
         if refs:
             lines[-1] += " [" + "; ".join(refs) + "]"
     else:
-        lines.append("A limited overview could not be generated because readable text was insufficient or local Qwen was unavailable.")
+        lines.append("No limited overview passed source validation; see bounded diagnostics for the recorded attempt and reason.")
     lines += ["", f"Reason: {escape(reason or 'The report did not meet research readiness checks.')}",
               "", "This orientation describes only the apparent subject and aim. It is not a validated research summary.",
               "No findings or statistical conclusions are established by this artifact.", ""]

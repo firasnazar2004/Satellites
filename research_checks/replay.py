@@ -12,7 +12,7 @@ from app.pipelines.research_reporting import (
 )
 
 
-def replay_saved_artifacts(artifact_dir: Path, output_dir: Path) -> dict:
+def replay_saved_artifacts(artifact_dir: Path, output_dir: Path, *, suffix: str = "") -> dict:
     """Validate a compatible artifact set and write only to ``output_dir``.
 
     The source PDF is deliberately never opened. Compatibility is established
@@ -23,30 +23,44 @@ def replay_saved_artifacts(artifact_dir: Path, output_dir: Path) -> dict:
     if output_dir == artifact_dir or artifact_dir in output_dir.parents:
         raise ValueError("Replay output must be outside the historical artifact directory")
     output_dir.mkdir(parents=True, exist_ok=True)
-    required = ("request.json", "evidence.json", "passages.json", "synthesis.json",
-                "research_quality.json", "research_diagnostics.json", "research_events.jsonl")
-    missing = [name for name in required if not (artifact_dir / name).is_file()]
+    def input_name(name):
+        path = Path(name)
+        return f"{path.stem}{suffix}{path.suffix}"
+
+    required = ("job.json", "request.json", "source.json", "evidence.json", "passages.json",
+                "synthesis.json", "research_quality.json", "research_diagnostics.json",
+                "research_events.jsonl")
+    missing = [input_name(name) for name in required if not (artifact_dir / input_name(name)).is_file()]
     if missing:
         raise ValueError("Missing replay artifacts: " + ", ".join(missing))
 
     def load(name):
-        return json.loads((artifact_dir / name).read_text(encoding="utf-8"))
+        return json.loads((artifact_dir / input_name(name)).read_text(encoding="utf-8"))
 
-    request, evidence_doc, raw_passages = load("request.json"), load("evidence.json"), load("passages.json")
+    job, request, source_doc = load("job.json"), load("request.json"), load("source.json")
+    evidence_doc, raw_passages = load("evidence.json"), load("passages.json")
     synthesis, quality_doc, diagnostics = (load("synthesis.json"), load("research_quality.json"),
                                             load("research_diagnostics.json"))
     versions = {evidence_doc.get("schema_version"), synthesis.get("schema_version"),
                 quality_doc.get("schema_version")}
-    if len(versions) != 1 or not versions <= {"2.2", "2.3"}:
+    if len(versions) != 1 or not versions <= {"2.2", "2.3", "2.4"}:
         raise ValueError(f"Incompatible artifact schema versions: {sorted(map(str, versions))}")
     if request.get("pipeline") != "research":
         raise ValueError("request.json is not a research run")
+    if job.get("pipeline") != "research" or not job.get("id"):
+        raise ValueError("job.json does not identify a research job")
+    if Path(job.get("input_path", "")).name != Path(request.get("input", "")).name:
+        raise ValueError("Job and request source names differ")
     if Path(request.get("input", "")).name != evidence_doc.get("source"):
         raise ValueError("Request source and evidence source names differ")
     source_hash = diagnostics.get("configuration", {}).get("source_sha256")
     if not isinstance(source_hash, str) or len(source_hash) != 64:
         raise ValueError("Research diagnostics do not contain a source hash")
-    event_lines = (artifact_dir / "research_events.jsonl").read_text(
+    if source_doc.get("sha256") != source_hash:
+        raise ValueError("Source manifest and diagnostics hashes differ")
+    if source_doc.get("filename") != evidence_doc.get("source"):
+        raise ValueError("Source manifest and evidence filenames differ")
+    event_lines = (artifact_dir / input_name("research_events.jsonl")).read_text(
         encoding="utf-8").splitlines()
     if not event_lines:
         raise ValueError("Research event log is empty")
@@ -58,6 +72,8 @@ def replay_saved_artifacts(artifact_dir: Path, output_dir: Path) -> dict:
     passages = [SourcePassage.model_validate({key: value for key, value in item.items()
                  if key in SourcePassage.model_fields}) for item in raw_passages]
     passage_by_id = {item.id: item for item in passages}
+    if len(passage_by_id) != len(passages):
+        raise ValueError("Passage IDs are not unique")
     records = [GroundedEvidence.model_validate(item) for item in evidence_doc.get("evidence", [])]
     if len({item.id for item in records}) != len(records):
         raise ValueError("Evidence IDs are not unique")
@@ -106,7 +122,8 @@ def replay_saved_artifacts(artifact_dir: Path, output_dir: Path) -> dict:
     report = render_report(evidence_doc.get("source", "saved-source"), replay_selected, passages,
                            evidence_doc.get("metadata", []), quality, latest)
     (output_dir / "replay_report.md").write_text(report, encoding="utf-8")
-    result = {"source_sha256": source_hash, "schema_version": next(iter(versions)),
+    result = {"job_id": job["id"], "source": source_doc["filename"],
+              "source_sha256": source_hash, "schema_version": next(iter(versions)),
               "passages": len(passages), "evidence": len(records),
               "saved_selected_ids": saved_selected_ids,
               "current_selected_ids": current_selected_ids,
@@ -124,8 +141,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact_dir", type=Path)
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--suffix", default="", help="Artifact filename suffix for saved sets")
     args = parser.parse_args(argv)
-    result = replay_saved_artifacts(args.artifact_dir, args.output_dir)
+    result = replay_saved_artifacts(args.artifact_dir, args.output_dir, suffix=args.suffix)
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 

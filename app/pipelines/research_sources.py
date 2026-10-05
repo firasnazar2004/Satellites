@@ -5,6 +5,7 @@ Reading-order detection is heuristic and exposes overrides and warnings.
 """
 
 import re
+from difflib import SequenceMatcher
 from collections import Counter
 from statistics import median
 
@@ -18,7 +19,7 @@ HEADINGS = {
     "methods": r"methods?|methodology|materials?andmethods?|studydesign|experimentalsetup",
     "results": r"results?|experiments?|evaluation|theoreticalresults?|analysis",
     "discussion": r"discussion|resultsanddiscussion",
-    "conclusions": r"conclusions?(?:andrecommendations)?|concludingremarks",
+    "conclusions": r"conclusions?(?:andrecommendations?|andfuturework)?|concludingremarks|futureworkandconclusions",
     "limitations": r"limitations?(?:andfuturework)?",
     "references": r"(?:listof)?references|bibliography|literaturecited",
     "appendices": r"appendi(?:x|ces)(?:[a-z])?|supplementary(?:material|information)?",
@@ -164,6 +165,24 @@ def normalize_text(raw):
     # technical compounds nor signs/ranges/numerical tokens are silently changed.
     text = re.sub(r"(?<=[A-Za-z])[-\u00ad]\s*\n\s*(?=[a-z])", "-", text)
     return " ".join(text.split())
+
+
+def normalized_raw_offset_map(raw):
+    """Map each normalized character back to its original raw-text span."""
+    normalized = normalize_text(raw)
+    mapping = [None] * len(normalized)
+    for tag, raw_start, raw_end, norm_start, norm_end in SequenceMatcher(
+            a=raw, b=normalized, autojunk=False).get_opcodes():
+        if tag == "equal":
+            for offset in range(norm_end - norm_start):
+                mapping[norm_start + offset] = (raw_start + offset, raw_start + offset + 1)
+        elif tag in {"replace", "insert"}:
+            for offset in range(norm_start, norm_end):
+                if raw_end > raw_start:
+                    mapping[offset] = (raw_start, raw_end)
+                else:
+                    mapping[offset] = (raw_start, raw_start)
+    return normalized, mapping
 
 
 def bbox(items):
@@ -324,6 +343,7 @@ def extract_pages(path, *, passage_chars=900, reading_order="auto"):
                                "bbox": (min(l["bbox"][0] for l in group), min(l["bbox"][1] for l in group),
                                         max(l["bbox"][2] for l in group), max(l["bbox"][3] for l in group))})
             for block_index, block in enumerate(blocks, 1):
+                _, raw_offset_map = normalized_raw_offset_map(block["raw_text"])
                 for part, (start, end, text) in enumerate(split_passage(block["text"], passage_chars), 1):
                     # A single heading isn't evidence; it remains in page blocks.
                     if heading_section(text) and len(text.split()) < 7:
@@ -331,6 +351,12 @@ def extract_pages(path, *, passage_chars=900, reading_order="auto"):
                     p = SourcePassage(id=f"P{number}-B{block_index}-{part}", page=number,
                         section=block["section"], text=text, raw_text=block["raw_text"],
                         bbox=block["bbox"], line_ids=block["line_ids"],
+                        block_id=f"P{number}-B{block_index}", normalized_start=start,
+                        normalized_end=end,
+                        raw_start=min((raw_offset_map[i][0] for i in range(start, min(end, len(raw_offset_map)))
+                                       if raw_offset_map[i] is not None), default=None),
+                        raw_end=max((raw_offset_map[i][1] for i in range(start, min(end, len(raw_offset_map)))
+                                     if raw_offset_map[i] is not None), default=None),
                         warnings=[w for w in warnings if w.startswith("Numeric token")])
                     entry = p.model_dump(mode="json")
                     entry["block_index"] = block_index

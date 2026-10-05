@@ -247,7 +247,8 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
     )
     async def research(
         file: UploadFile, max_chunk_chars: Annotated[int, Form(ge=500, le=4000)] = 3000,
-        document_type: Annotated[Literal["auto", "empirical", "review", "theoretical"], Form()] = "auto",
+        document_type: Annotated[Literal["auto", "empirical", "review", "theoretical",
+            "theoretical_with_experiments", "mixed"], Form()] = "auto",
         reading_order: Annotated[Literal["auto", "single", "two", "three"], Form()] = "auto",
     ):
         return await submit(

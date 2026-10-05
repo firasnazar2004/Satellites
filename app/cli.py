@@ -87,7 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     research.add_argument("input", type=Path)
     research.add_argument("--max-chunk-chars", type=int, default=3000)
-    research.add_argument("--document-type", choices=["auto", "empirical", "review", "theoretical"], default="auto")
+    research.add_argument("--document-type", choices=["auto", "empirical", "review", "theoretical",
+                           "theoretical_with_experiments", "mixed"], default="auto")
     research.add_argument("--reading-order", choices=["auto", "single", "two", "three"], default="auto")
     research.add_argument("--jobs-root", type=Path, default=Path("outputs/jobs"))
     return parser
