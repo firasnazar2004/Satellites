@@ -24,8 +24,7 @@ from app.core.chat import (
     OllamaProtocolError,
     OllamaUnavailableError,
 )
-from app.core.llm import DEFAULT_MODEL, OLLAMA_BASE_URL, RESEARCH_MODEL
-from app.core.research_artifacts import research_artifacts, research_quality
+from app.core.llm import DEFAULT_MODEL, OLLAMA_BASE_URL
 from app.core.service import JobService
 from app.models.analysis import AnalysisPlan
 from app.models.chat import ChatRequest
@@ -124,22 +123,19 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
                 )
             available = {m.get("name") for m in models}
             qwen = DEFAULT_MODEL in available
-            research_available = RESEARCH_MODEL in available
         except Exception:
             qwen = False
-            research_available = False
         return {
             "api": "ok",
             "qwen3_8b_available": qwen,
-            "research_model": RESEARCH_MODEL,
-            "research_model_available": research_available,
+            "research_model": None,
+            "research_model_available": False,
             "Rscript": bool(shutil.which("Rscript")),
             "worker_count": 1,
         }
 
     def response(job):
         artifacts = {p.name: p for p in job.artifacts}
-        artifacts.update(research_artifacts(job))
         return {
             "id": job.id,
             "pipeline": job.pipeline,
@@ -153,7 +149,7 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
                 for p in artifacts.values()
             ],
             "status_url": f"/jobs/{job.id}",
-            "research": research_quality(job),
+            "research": None,
         }
 
     async def submit(file, pipeline, suffix, options):
@@ -238,25 +234,6 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
         )
 
     @app.post(
-        "/pipelines/research",
-        status_code=202,
-        response_model=JobResponse,
-        description="Serial passage-grounded extraction. Poll the research quality field as well as job status; partial reports and diagnostics remain downloadable.",
-        dependencies=[Depends(authorize)],
-        tags=["Pipelines"],
-    )
-    async def research(
-        file: UploadFile, max_chunk_chars: Annotated[int, Form(ge=500, le=4000)] = 3000,
-        document_type: Annotated[Literal["auto", "empirical", "review", "theoretical",
-            "theoretical_with_experiments", "mixed"], Form()] = "auto",
-        reading_order: Annotated[Literal["auto", "single", "two", "three"], Form()] = "auto",
-    ):
-        return await submit(
-            file, PipelineType.RESEARCH, ".pdf", {"max_chunk_chars": max_chunk_chars,
-                "document_type": document_type, "reading_order": reading_order}
-        )
-
-    @app.post(
         "/pipelines/dataset",
         status_code=202,
         dependencies=[Depends(authorize)],
@@ -331,12 +308,10 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
         if not value:
             raise HTTPException(404, "Unknown job")
         allowed = {p.name: p for p in value.artifacts}
-        allowed.update(research_artifacts(value))
         for name in (
             "job.json",
             "worker.log",
             "error.txt",
-            "rejected_evidence.json",
             "interpretation_rejections.jsonl",
         ):
             path = value.output_dir / name

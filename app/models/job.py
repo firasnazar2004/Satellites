@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class PipelineType(StrEnum):
     FLASHCARDS = "flashcards"
     DATASET = "dataset"
+    # Kept so persisted historical jobs continue to load. Worker dispatch does not support it.
     RESEARCH = "research"
 
 

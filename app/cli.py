@@ -82,15 +82,6 @@ def build_parser() -> argparse.ArgumentParser:
     dataset.add_argument(
         "--record-mode", choices=["single_line", "standard"], default="single_line"
     )
-    research = subparsers.add_parser(
-        "research", help="Extract validated PDF evidence and a cited summary"
-    )
-    research.add_argument("input", type=Path)
-    research.add_argument("--max-chunk-chars", type=int, default=3000)
-    research.add_argument("--document-type", choices=["auto", "empirical", "review", "theoretical",
-                           "theoretical_with_experiments", "mixed"], default="auto")
-    research.add_argument("--reading-order", choices=["auto", "single", "two", "three"], default="auto")
-    research.add_argument("--jobs-root", type=Path, default=Path("outputs/jobs"))
     return parser
 
 
@@ -101,12 +92,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_flashcard_job(args)
     if args.command == "dataset":
         return _run_dataset_job(args)
-    if args.command == "research":
-        return _run_pipeline(
-            PipelineType.RESEARCH, args, {"max_chunk_chars": args.max_chunk_chars,
-                "document_type": args.document_type, "reading_order": args.reading_order}
-        )
-
     raise AssertionError(f"Unhandled command: {args.command}")
 
 
@@ -137,16 +122,6 @@ def _run_pipeline(pipeline, args, options):
     except Exception as exc:
         print(f"{pipeline.value} job failed: {exc}", file=sys.stderr)
         if job is not None:
-            if pipeline == PipelineType.RESEARCH:
-                from app.core.research_artifacts import research_quality
-
-                quality = research_quality(job)
-                if quality:
-                    print(f"Research quality: {quality.status}", file=sys.stderr)
-                    print(f"Processing: {quality.processing_status}", file=sys.stderr)
-                    print(f"Report: {quality.report_kind} ({quality.report_availability})",
-                          file=sys.stderr)
-                    print(f"Extraction complete: {quality.extraction_complete}", file=sys.stderr)
             print(
                 f"Failure details: {job.output_dir / 'job.json'}",
                 file=sys.stderr,
@@ -156,18 +131,6 @@ def _run_pipeline(pipeline, args, options):
     print(f"Job {job.id} completed")
     for artifact in job.artifacts:
         print(artifact)
-    if pipeline == PipelineType.RESEARCH:
-        from app.core.research_artifacts import research_quality
-
-        quality = research_quality(job)
-        if quality:
-            print(f"Research quality: {quality.status}")
-            print(f"Report: {quality.report_kind} ({quality.report_availability})")
-            print(f"Extraction complete: {quality.extraction_complete}")
-            for reason in quality.missing_coverage + quality.reasons:
-                print(f"- {reason}")
-            if quality.status != "completed":
-                return 2
     return 0
 
 

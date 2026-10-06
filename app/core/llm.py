@@ -1,7 +1,6 @@
 """Small Ollama adapter for schema-constrained local LLM responses."""
 
 import time
-import os
 from typing import TypeVar
 
 import ollama
@@ -10,7 +9,6 @@ from pydantic import BaseModel
 StructuredResponse = TypeVar("StructuredResponse", bound=BaseModel)
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen3:8b"
-RESEARCH_MODEL = os.environ.get("LOCAL_AI_RESEARCH_MODEL", "qwen3.5:4b")
 
 
 def generate_structured(
@@ -41,11 +39,6 @@ def generate_structured(
             )
             break
         except ollama.ResponseError as exc:
-            if model == RESEARCH_MODEL and exc.status_code == 404:
-                raise RuntimeError(
-                    f"{RESEARCH_MODEL} is required for the research pipeline but is "
-                    f"unavailable in Ollama; run `ollama pull {RESEARCH_MODEL}`"
-                ) from exc
             if exc.status_code not in {500, 502, 503} or attempt == 2:
                 raise
             time.sleep(2**attempt)
