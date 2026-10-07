@@ -82,6 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
     dataset.add_argument(
         "--record-mode", choices=["single_line", "standard"], default="single_line"
     )
+    research = subparsers.add_parser("research", help="Analyze a text-native research PDF")
+    research.add_argument("input", type=Path, help="Path to a PDF")
+    research.add_argument("--jobs-root", type=Path, default=Path("outputs/jobs"))
     return parser
 
 
@@ -92,6 +95,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_flashcard_job(args)
     if args.command == "dataset":
         return _run_dataset_job(args)
+    if args.command == "research":
+        return _run_pipeline(PipelineType.RESEARCH, args, {})
     raise AssertionError(f"Unhandled command: {args.command}")
 
 

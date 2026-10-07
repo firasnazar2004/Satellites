@@ -25,6 +25,7 @@ from app.core.chat import (
     OllamaUnavailableError,
 )
 from app.core.llm import DEFAULT_MODEL, OLLAMA_BASE_URL
+from app.core.research_config import CONFIG as RESEARCH_CONFIG
 from app.core.service import JobService
 from app.models.analysis import AnalysisPlan
 from app.models.chat import ChatRequest
@@ -123,13 +124,15 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
                 )
             available = {m.get("name") for m in models}
             qwen = DEFAULT_MODEL in available
+            research_available = RESEARCH_CONFIG.model in available
         except Exception:
             qwen = False
+            research_available = False
         return {
             "api": "ok",
             "qwen3_8b_available": qwen,
-            "research_model": None,
-            "research_model_available": False,
+            "research_model": RESEARCH_CONFIG.model,
+            "research_model_available": research_available,
             "Rscript": bool(shutil.which("Rscript")),
             "worker_count": 1,
         }
@@ -234,6 +237,15 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
         )
 
     @app.post(
+        "/pipelines/research",
+        status_code=202,
+        dependencies=[Depends(authorize)],
+        tags=["Pipelines"],
+    )
+    async def research(file: UploadFile):
+        return await submit(file, PipelineType.RESEARCH, ".pdf", {})
+
+    @app.post(
         "/pipelines/dataset",
         status_code=202,
         dependencies=[Depends(authorize)],
@@ -313,6 +325,13 @@ def create_app(storage: Path | None = None, chat_service: ChatService | None = N
             "worker.log",
             "error.txt",
             "interpretation_rejections.jsonl",
+            "research_diagnostics.json",
+            "research_rejections.jsonl",
+            "research_source_map.json",
+            "research_evidence.json",
+            "research_profile.json",
+            "research_coverage.json",
+            "research_plan.json",
         ):
             path = value.output_dir / name
             if path.is_file():

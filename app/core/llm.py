@@ -1,7 +1,7 @@
 """Small Ollama adapter for schema-constrained local LLM responses."""
 
 import time
-from typing import TypeVar
+from typing import Callable, TypeVar
 
 import ollama
 from pydantic import BaseModel
@@ -18,6 +18,10 @@ def generate_structured(
     model: str = DEFAULT_MODEL,
     system_prompt: str | None = None,
     keep_alive: str | int = "2m",
+    num_ctx: int = 4096,
+    num_predict: int = 1800,
+    timeout: int = 300,
+    on_raw: Callable[[str], None] | None = None,
 ) -> StructuredResponse:
     """Generate a response with Ollama and validate it as a Pydantic model."""
 
@@ -26,14 +30,14 @@ def generate_structured(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    client = ollama.Client(host=OLLAMA_BASE_URL, timeout=300, trust_env=False)
+    client = ollama.Client(host=OLLAMA_BASE_URL, timeout=timeout, trust_env=False)
     for attempt in range(3):
         try:
             response = client.chat(
                 model=model,
                 messages=messages,
                 format=response_model.model_json_schema(),
-                options={"temperature": 0, "num_ctx": 4096, "num_predict": 1800},
+                options={"temperature": 0, "num_ctx": num_ctx, "num_predict": num_predict},
                 think=False,
                 keep_alive=keep_alive,
             )
@@ -43,6 +47,8 @@ def generate_structured(
                 raise
             time.sleep(2**attempt)
 
+    if on_raw:
+        on_raw(response.message.content or "")
     if (
         not response.message.content
         or getattr(response, "done_reason", None) == "length"

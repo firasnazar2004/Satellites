@@ -18,6 +18,8 @@ def main():
             from app.pipelines.dataset_full import process_dataset as processor
         elif request["pipeline"] == "flashcards":
             from app.pipelines.flashcards import process_flashcard_file as processor
+        elif request["pipeline"] == "research":
+            from app.pipelines.research import process_research_file as processor
         else:
             raise ValueError("Unsupported pipeline")
         artifacts = processor(source, output, **request["options"])
