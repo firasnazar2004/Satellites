@@ -18,7 +18,10 @@ tests/*
 !tests/test_research_core.py
 checks/
 !checks/test_research.py
-docs/
+docs/*
+!docs/assets/
+docs/assets/*
+!docs/assets/readme/
 README.md
 .DS_Store
 
