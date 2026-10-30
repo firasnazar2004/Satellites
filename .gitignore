@@ -13,6 +13,9 @@ outputs/
 logs/
 examples/
 tests/
+!tests/
+tests/*
+!tests/test_research_core.py
 checks/
 !checks/test_research.py
 docs/
